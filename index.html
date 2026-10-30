@@ -1,0 +1,376 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Spark Monitor</title>
+<style>
+  :root {
+    --bg: #f4f5f7; --panel: #ffffff; --line: #e3e5ea; --track: #e6e8ee;
+    --text: #1b1e24; --muted: #6b7280; --ok: #16a34a; --warn: #d97706; --hot: #dc2626;
+    --gpu: #76b900; --cpu: #2563eb; --mem: #7c3aed; --io: #0891b2; --net: #0d9488; --pwr: #db2777;
+    color-scheme: light;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0d0f13; --panel: #161a21; --line: #252a33; --track: #262b35;
+      --text: #e7e9ee; --muted: #8b93a1; --ok: #22c55e; --warn: #f59e0b; --hot: #ef4444;
+      --gpu: #8bd400; --cpu: #60a5fa; --mem: #a78bfa; --io: #22d3ee; --net: #2dd4bf; --pwr: #f472b6;
+      color-scheme: dark;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0d0f13; --panel: #161a21; --line: #252a33; --track: #262b35;
+    --text: #e7e9ee; --muted: #8b93a1; --ok: #22c55e; --warn: #f59e0b; --hot: #ef4444;
+    --gpu: #8bd400; --cpu: #60a5fa; --mem: #a78bfa; --io: #22d3ee; --net: #2dd4bf; --pwr: #f472b6;
+    color-scheme: dark;
+  }
+  .theme { margin-left: auto; display: inline-flex; align-items: center; gap: 8px; cursor: pointer;
+           color: var(--muted); font-size: 13px; user-select: none; align-self: center; }
+  .theme input { position: absolute; opacity: 0; width: 1px; height: 1px; }
+  .theme .sw { width: 40px; height: 22px; border-radius: 11px; background: var(--track); border: 1px solid var(--line);
+               position: relative; transition: background .2s; }
+  .theme .sw::after { content: ""; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%;
+                      background: var(--text); transition: transform .2s; }
+  .theme input:checked + .sw { background: var(--cpu); }
+  .theme input:checked + .sw::after { transform: translateX(18px); background: #fff; }
+  .theme input:focus-visible + .sw { outline: 2px solid var(--cpu); outline-offset: 2px; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  .wrap { max-width: 1400px; margin: 0 auto; padding: 16px; }
+  header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 20px; margin-bottom: 14px; }
+  header h1 { font-size: 18px; margin: 0; letter-spacing: .2px; }
+  header .meta { color: var(--muted); font-variant-numeric: tabular-nums; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); margin-right: 6px; }
+  .dot.live { background: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 25%, transparent); }
+  .grid { display: grid; gap: 12px; }
+  .dials { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); margin-bottom: 12px; }
+  @media (min-width: 1100px) { .dials { grid-template-columns: repeat(8, minmax(0, 1fr)); gap: 10px; } }
+  .dials .card { padding: 12px 10px; }
+  .panels { grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px; min-width: 0; }
+  .card h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 0 0 10px; font-weight: 600; }
+  .dial { text-align: center; }
+  .dial svg.gauge { width: 100%; max-width: 170px; display: block; margin: 0 auto; }
+  .gauge .track { stroke: var(--track); }
+  .gauge .arc { transition: stroke-dasharray .6s ease, stroke .4s; }
+  .gauge .val { font-size: 26px; font-weight: 650; fill: var(--text); font-variant-numeric: tabular-nums; }
+  .gauge .tick { font-size: 8px; fill: var(--muted); }
+  .dial .sub { white-space: pre-line; color: var(--muted); font-size: 11.5px; min-height: 17px; font-variant-numeric: tabular-nums; }
+  .spark { width: 100%; height: 34px; display: block; margin-top: 6px; }
+  .spark polyline { fill: none; stroke-width: 1.5; vector-effect: non-scaling-stroke; }
+  .spark polygon { opacity: .12; }
+  .cores { display: grid; grid-template-columns: repeat(10, 1fr); gap: 4px; margin-bottom: 10px; }
+  .core { height: 54px; background: var(--track); border-radius: 4px; position: relative; overflow: hidden; }
+  .core i { position: absolute; left: 0; right: 0; bottom: 0; background: var(--cpu); transition: height .5s; }
+  .core span { position: absolute; inset: auto 0 2px; text-align: center; font-size: 10px; color: var(--text); font-variant-numeric: tabular-nums; font-weight: 600; text-shadow: 0 0 3px var(--panel), 0 0 2px var(--panel); }
+  .cluster { font-size: 12px; color: var(--muted); margin: 2px 0 6px; display: flex; justify-content: space-between; }
+  .h2val { text-transform: none; letter-spacing: 0; font-size: 13px; font-weight: 500; margin-left: 8px; font-variant-numeric: tabular-nums; }
+  .stack { display: flex; height: 22px; border-radius: 6px; overflow: hidden; background: var(--track); margin: 4px 0 10px; }
+  .stack i { height: 100%; transition: width .5s; }
+  .mlegend { display: flex; flex-wrap: wrap; gap: 6px 16px; font-variant-numeric: tabular-nums; margin-bottom: 8px; }
+  .mlegend span { white-space: nowrap; }
+  .mlegend b { display: inline-block; width: 11px; height: 11px; border-radius: 2px; vertical-align: -1px; margin-right: 6px; }
+  .mlegend .meta { color: var(--muted); }
+  .models { border-top: 1px solid var(--line); padding-top: 8px; margin-top: 4px; }
+  .model { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 12px; padding: 4px 0; font-variant-numeric: tabular-nums; }
+  .model b { font-weight: 600; min-width: 0; overflow-wrap: anywhere; }
+  .model span { color: var(--muted); white-space: nowrap; font-size: 12px; margin-left: auto; }
+  .row { display: flex; justify-content: space-between; gap: 12px; padding: 6px 0; border-top: 1px solid var(--line); font-variant-numeric: tabular-nums; }
+  .row:first-of-type { border-top: 0; }
+  .row .k { color: var(--muted); }
+  .bar { height: 6px; background: var(--track); border-radius: 3px; overflow: hidden; margin: 2px 0 8px; }
+  .bar i { display: block; height: 100%; background: var(--mem); transition: width .5s; }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  th, td { text-align: left; padding: 5px 6px; border-top: 1px solid var(--line); white-space: nowrap; }
+  th { color: var(--muted); font-weight: 500; font-size: 12px; border-top: 0; }
+  td.num, th.num { text-align: right; }
+  .card.wide { grid-column: 1 / -1; }
+  @media (min-width: 1100px) { .card.span2 { grid-column: span 2; } }
+  .subhead { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; margin: 4px 0 6px; }
+  .subhead:not(:first-of-type) { border-top: 1px solid var(--line); padding-top: 14px; margin-top: 14px; }
+  .subhead h3 { font-size: 15px; margin: 0; font-weight: 600; }
+  .subhead span { font-weight: 600; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .subhead span.muted { color: var(--muted); font-weight: 400; font-size: 13px; }
+  table.procs { table-layout: fixed; min-width: 640px; }
+  table.procs td, table.procs th { padding: 8px; }
+  table.procs td { overflow: hidden; text-overflow: ellipsis; }
+  table.procs td.cmd { max-width: none; width: auto; }
+  .kind { color: var(--muted); margin-left: 4px; font-size: 12px; }
+  td.name { max-width: 170px; overflow: hidden; text-overflow: ellipsis; }
+  td.cmd { max-width: 0; width: 100%; overflow: hidden; text-overflow: ellipsis; color: var(--muted); }
+  .scroll { overflow-x: auto; }
+  .empty { color: var(--muted); padding: 6px 0; }
+  .legend { display: flex; gap: 14px; font-size: 12px; color: var(--muted); }
+  .legend b { display: inline-block; width: 10px; height: 3px; vertical-align: middle; margin-right: 4px; }
+  @media (max-width: 520px) { .cores { grid-template-columns: repeat(5, 1fr); } }
+</style>
+<script>
+  // apply a saved theme before first paint to avoid a flash
+  try { const t = localStorage.getItem("theme"); if (t) document.documentElement.dataset.theme = t; } catch (e) {}
+</script>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1><span class="dot" id="live"></span>Spark Monitor</h1>
+    <span class="meta" id="gpuname">connecting…</span>
+    <span class="meta" id="uptime"></span>
+    <span class="meta" id="load"></span>
+    <span class="meta" id="cost"></span>
+    <label class="theme"><span>Dark mode</span><input type="checkbox" id="theme"><span class="sw"></span></label>
+  </header>
+
+  <section class="grid dials" id="dials"></section>
+
+  <section class="grid panels">
+    <div class="card">
+      <h2>CPU cores</h2>
+      <div id="clusters"></div>
+    </div>
+
+    <div class="card">
+      <h2>Unified memory <span class="h2val" id="memhead"></span></h2>
+      <div id="memrows"></div>
+    </div>
+
+    <div class="card">
+      <h2>GPU</h2>
+      <div id="gpurows"></div>
+      <svg class="spark" id="spark-power" viewBox="0 0 120 34" preserveAspectRatio="none"></svg>
+      <div class="legend"><span><b style="background:var(--warn)"></b>power, last 2 min</span></div>
+    </div>
+
+    <div class="card">
+      <h2>Temperatures</h2>
+      <div id="temps"></div>
+    </div>
+
+    <div class="card span2">
+      <h2>Disk &amp; network</h2>
+      <div id="iorows"></div>
+      <svg class="spark" id="spark-net" viewBox="0 0 120 34" preserveAspectRatio="none"></svg>
+      <div class="legend"><span><b style="background:var(--io)"></b>net rx</span><span><b style="background:var(--mem)"></b>net tx</span></div>
+    </div>
+
+    <div class="card wide">
+      <h2>Processes</h2>
+      <div class="subhead"><h3>GPU processes</h3><span id="gpusum"></span></div>
+      <div class="scroll"><table class="procs" id="gpuprocs"></table></div>
+      <div class="subhead"><h3>Top CPU processes</h3><span class="muted">by CPU · refreshed every 3 s</span></div>
+      <div class="scroll"><table class="procs" id="topprocs"></table></div>
+    </div>
+  </section>
+</div>
+
+<script>
+const HIST = 120;
+const $ = id => document.getElementById(id);
+const hist = {};
+const push = (k, v) => { (hist[k] ||= []).push(v ?? 0); if (hist[k].length > HIST) hist[k].shift(); };
+
+const fmtB = b => {
+  if (b == null) return "—";
+  const u = ["B", "KiB", "MiB", "GiB", "TiB"]; let i = 0;
+  while (Math.abs(b) >= 1024 && i < u.length - 1) { b /= 1024; i++; }
+  return (b >= 100 || i === 0 ? b.toFixed(0) : b.toFixed(1)) + " " + u[i];
+};
+const fmtRate = b => fmtB(b) + "/s";
+const fmtUp = s => { const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60); return (d ? d + "d " : "") + h + "h " + m + "m"; };
+const level = p => p >= 90 ? "var(--hot)" : p >= 70 ? "var(--warn)" : null;
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+// ---- dials: 270° SVG arc gauges, 0–100 %
+const R = 50, C = 2 * Math.PI * R, SWEEP = 0.75 * C;
+const DIALS = [
+  { id: "gpu",  label: "GPU",        color: "--gpu" },
+  { id: "gclk", label: "GPU clock",  color: "--gpu" },
+  { id: "pwr",  label: "GPU power",  color: "--pwr" },
+  { id: "cpu",  label: "CPU",        color: "--cpu" },
+  { id: "mem",  label: "Memory",     color: "--mem" },
+  { id: "net",  label: "Network",    color: "--net" },
+  { id: "disk", label: "Disk busy",  color: "--io"  },
+  { id: "fs",   label: "Root FS",    color: "--io"  },
+];
+function tickLabels() {
+  return [0, 25, 50, 75, 100].map(t => {
+    const a = (135 + t * 2.7) * Math.PI / 180, r = R + 10;
+    return `<text class="tick" x="${60 + r * Math.cos(a)}" y="${60 + r * Math.sin(a) + 3}" text-anchor="middle">${t}</text>`;
+  }).join("");
+}
+$("dials").innerHTML = DIALS.map(d => `
+  <div class="card dial">
+    <h2>${d.label}</h2>
+    <svg class="gauge" viewBox="0 -6 120 112">
+      <circle class="track" cx="60" cy="60" r="${R}" fill="none" stroke-width="10" stroke-linecap="round"
+              stroke-dasharray="${SWEEP} ${C}" transform="rotate(135 60 60)"/>
+      <circle class="arc" id="arc-${d.id}" cx="60" cy="60" r="${R}" fill="none" stroke-width="10" stroke-linecap="round"
+              stroke="var(${d.color})" stroke-dasharray="0 ${C}" transform="rotate(135 60 60)"/>
+      ${tickLabels()}
+      <text class="val" id="val-${d.id}" x="60" y="68" text-anchor="middle">—</text>
+    </svg>
+    <div class="sub" id="sub-${d.id}"></div>
+    <svg class="spark" id="spark-${d.id}" viewBox="0 0 120 34" preserveAspectRatio="none"></svg>
+  </div>`).join("");
+
+function setDial(id, pct, sub) {
+  const d = DIALS.find(x => x.id === id);
+  const p = pct == null ? null : Math.max(0, Math.min(100, pct));
+  const arc = $("arc-" + id);
+  arc.setAttribute("stroke-dasharray", `${p == null ? 0 : SWEEP * p / 100} ${C}`);
+  arc.setAttribute("stroke", level(p ?? 0) || `var(${d.color})`);
+  $("val-" + id).textContent = p == null ? "n/a" : Math.round(p) + "%";
+  $("sub-" + id).textContent = sub || "";
+  push(id, p);
+  spark("spark-" + id, [[hist[id], `var(${d.color})`]], 100);
+}
+
+function spark(id, series, max) {
+  const m = max ?? Math.max(1, ...series.flatMap(s => s[0]));
+  $(id).innerHTML = series.map(([data, color]) => {
+    const off = HIST - data.length;
+    const pts = data.map((v, i) => `${off + i},${(34 - 32 * v / m).toFixed(1)}`).join(" ");
+    return data.length < 2 ? "" :
+      `<polygon fill="${color}" points="${off},34 ${pts} ${HIST - 1},34"/><polyline stroke="${color}" points="${pts}"/>`;
+  }).join("");
+}
+
+const rows = list => list.map(([k, v]) => `<div class="row"><span class="k">${k}</span><span>${v}</span></div>`).join("");
+
+// ---- render one sample
+function render(s) {
+  const g = s.gpu;
+  $("gpuname").textContent = g ? `${g.name} · ${s.ncpu} CPU cores` : "GPU unavailable (NVML)";
+  $("uptime").textContent = "up " + fmtUp(s.uptime);
+  $("load").textContent = "load " + s.load.map(x => x.toFixed(2)).join(" ");
+  $("cost").textContent = `sample ${s.sample_ms.toFixed(1)} ms`;
+
+  const mem = s.mem, memPct = 100 * mem.used / mem.total;
+  setDial("gpu", g?.util, g ? `${g.power_w?.toFixed(1) ?? "—"} W · ${g.temp ?? "—"} °C` : "");
+  setDial("cpu", s.cpu.total, s.cpu.total == null ? "" : `iowait ${s.cpu.iowait.toFixed(1)}%`);
+  setDial("mem", memPct, `${fmtB(mem.used)} of ${fmtB(mem.total)}`);
+  setDial("gclk", g?.sm_mhz != null && g.sm_max_mhz ? 100 * g.sm_mhz / g.sm_max_mhz : null,
+          g ? `${g.sm_mhz} / ${g.sm_max_mhz} MHz · ${g.pstate ?? ""}` : "");
+  setDial("pwr", g?.power_w != null && g.power_max_w ? 100 * g.power_w / g.power_max_w : null,
+          g?.power_w != null ? `${g.power_w.toFixed(1)} of ${g.power_max_w} W` : "");
+  // network: busiest direction on the busiest link, as % of its negotiated speed
+  const linked = s.net.filter(n => n.link_mbps);
+  const netPct = linked.length ? Math.max(...linked.map(n => 100 * Math.max(n.rx_bps, n.tx_bps) * 8 / (n.link_mbps * 1e6))) : null;
+  const netRx = s.net.reduce((a, n) => a + n.rx_bps, 0), netTx = s.net.reduce((a, n) => a + n.tx_bps, 0);
+  const fmtLink = m => m >= 1000 ? m / 1000 + " Gb/s" : m + " Mb/s";
+  setDial("net", netPct, `↓ ${fmtRate(netRx)}\n↑ ${fmtRate(netTx)}` +
+          (linked.length ? `\n${linked.map(n => fmtLink(n.link_mbps)).join(", ")} link` : ""));
+  setDial("disk", s.disk?.util, s.disk ? `R ${fmtRate(s.disk.read_bps)}\nW ${fmtRate(s.disk.write_bps)}` : "");
+  setDial("fs", 100 * s.fs.used / s.fs.total, `${fmtB(s.fs.used)} of ${fmtB(s.fs.total)}`);
+
+  // CPU cores, grouped by cluster (max frequency)
+  const groups = {};
+  for (const c of s.cpu.per) (groups[c.max_mhz] ||= []).push(c);
+  $("clusters").innerHTML = Object.keys(groups).sort((a, b) => b - a).map(mx => {
+    const cs = groups[mx], avg = cs.reduce((a, c) => a + c.util, 0) / cs.length;
+    const name = +mx >= 3500 ? "Performance (Cortex-X925)" : "Efficiency (Cortex-A725)";
+    const mhz = Math.round(cs.reduce((a, c) => a + (c.mhz || 0), 0) / cs.length);
+    return `<div class="cluster"><span>${name}</span><span>${avg.toFixed(0)}% · ${mhz} MHz avg</span></div>
+      <div class="cores">${cs.map(c => `<div class="core" title="cpu${c.id} · ${c.mhz} MHz">
+        <i style="height:${c.util.toFixed(0)}%;${level(c.util) ? "background:" + level(c.util) : ""}"></i>
+        <span>${c.util.toFixed(0)}</span></div>`).join("")}</div>`;
+  }).join("") || `<div class="empty">warming up…</div>`;
+
+  // Ollama loaded models (shown in the unified memory card)
+  const o = s.ollama;
+  let ollamaHtml = "";
+  if (o) {
+    const total = o.models.reduce((a, m) => a + m.size, 0);
+    const until = t => { const m = Math.round((new Date(t) - Date.now()) / 60000); return m > 0 ? `unloads in ${m} min` : "unloading"; };
+    ollamaHtml = `<div class="models"><div class="cluster"><span>Ollama</span><span>${
+      !o.up ? "not reachable" : o.models.length ? `${o.models.length} loaded · ${fmtB(total)}` : "no models loaded"}</span></div>` +
+      o.models.map(m => `<div class="model" title="${esc([m.params, m.quant].filter(Boolean).join(" · "))}">
+        <b>${esc(m.name)}</b><span>${fmtB(m.size)} · ${m.size ? Math.round(100 * m.size_vram / m.size) : 0}% GPU${
+          m.ctx ? ` · ${Math.round(m.ctx / 1024)}k ctx` : ""}${m.expires ? " · " + until(m.expires) : ""}</span></div>`).join("") +
+      `</div>`;
+  }
+
+  // memory: stacked bar of where the shared 128 GB goes
+  const gpuMem = Math.min(mem.resident, g ? g.procs.reduce((a, p) => a + (p.gpu_mem || 0), 0) : 0);
+  const swapPct = mem.swap_total ? 100 * mem.swap_used / mem.swap_total : 0;
+  const segs = [
+    ["GPU processes", gpuMem, "var(--gpu)"],
+    ["apps", mem.resident - gpuMem, "var(--mem)"],
+    ["page cache", mem.cache, "color-mix(in srgb, var(--mem) 40%, var(--track))"],
+    ["buffers", mem.buffers, "color-mix(in srgb, var(--mem) 20%, var(--track))"],
+    ["free", mem.free, "var(--track)"],
+  ];
+  $("memhead").textContent = `${fmtB(mem.resident)} / ${fmtB(mem.total)} used`;
+  $("memrows").innerHTML =
+    `<div class="stack">${segs.slice(0, 4).map(([k, v, c]) =>
+      `<i style="width:${100 * v / mem.total}%;background:${c}" title="${k} ${fmtB(v)}"></i>`).join("")}</div>
+     <div class="mlegend">${segs.map(([k, v, c]) => `<span><b style="background:${c}"></b>${k} ${fmtB(v)}</span>`).join("")}
+       <span class="meta">available ${fmtB(mem.avail)} · swap ${fmtB(mem.swap_used)} (${swapPct.toFixed(1)}%)</span></div>` + ollamaHtml;
+
+  // GPU
+  push("power", g?.power_w);
+  $("gpurows").innerHTML = g ? rows([["Utilization", `${g.util ?? "—"}%`], ["Power draw", `${g.power_w?.toFixed(1) ?? "—"} W`],
+    ["Temperature", `${g.temp ?? "—"} °C`], ["SM clock", `${g.sm_mhz} MHz (max ${g.sm_max_mhz})`],
+    ["Performance state", g.pstate ?? "—"], ["Processes", g.procs.length]]) : `<div class="empty">NVML not available</div>`;
+  spark("spark-power", [[hist.power, "var(--warn)"]]);
+
+  // temperatures
+  const temps = (g?.temp != null ? [{ label: "GPU", c: g.temp }] : []).concat(s.temps);
+  $("temps").innerHTML = temps.map(t => {
+    const p = Math.min(100, t.c);  // bar scaled 0–100 °C
+    return `<div class="row"><span class="k">${t.label}</span><span>${t.c.toFixed(1)} °C</span></div>
+            <div class="bar"><i style="width:${p}%;background:${t.c >= 85 ? "var(--hot)" : t.c >= 70 ? "var(--warn)" : "var(--ok)"}"></i></div>`;
+  }).join("");
+
+  // disk & network
+  const rx = s.net.reduce((a, n) => a + n.rx_bps, 0), tx = s.net.reduce((a, n) => a + n.tx_bps, 0);
+  push("rx", rx); push("tx", tx);
+  $("iorows").innerHTML = rows([
+    ["Disk read", fmtRate(s.disk?.read_bps)], ["Disk write", fmtRate(s.disk?.write_bps)],
+    ...s.net.map(n => [n.name, `↓ ${fmtRate(n.rx_bps)} · ↑ ${fmtRate(n.tx_bps)}`])]);
+  spark("spark-net", [[hist.rx, "var(--io)"], [hist.tx, "var(--mem)"]]);
+
+  // process tables
+  // process tables share column widths so they line up
+  const cols = `<colgroup><col style="width:100px"><col style="width:190px"><col style="width:110px"><col style="width:100px"><col></colgroup>`;
+  const head = metric => `<tr><th>PID</th><th>Name</th><th class="num">${metric}</th><th class="num">RSS</th><th>Command</th></tr>`;
+  const cmdCell = c => `<td class="cmd" title="${esc(c)}">${esc(c)}</td>`;
+  const gp = g ? g.procs : [];
+  $("gpusum").textContent = g ? `${gp.length} process${gp.length === 1 ? "" : "es"} · ${fmtB(gp.reduce((a, p) => a + (p.gpu_mem || 0), 0))} GPU mem` : "";
+  $("gpuprocs").innerHTML = cols + head("GPU mem") + (gp.length
+    ? gp.sort((a, b) => (b.gpu_mem || 0) - (a.gpu_mem || 0)).map(p =>
+        `<tr><td>${p.pid}</td><td title="${p.kind.includes("C") ? "compute" : ""}${p.kind.length > 1 ? " + " : ""}${p.kind.includes("G") ? "graphics" : ""}">${esc(p.name)}<span class="kind">${p.kind}</span></td>
+         <td class="num">${fmtB(p.gpu_mem)}</td><td class="num">${fmtB(p.rss)}</td>${cmdCell(p.cmd)}</tr>`).join("")
+    : `<tr><td class="empty" colspan="5">No GPU processes</td></tr>`);
+  $("topprocs").innerHTML = cols + head("CPU") + (s.top.length
+    ? s.top.map(p => `<tr><td>${p.pid}</td><td title="${esc(p.name)}">${esc(p.name)}</td><td class="num">${p.cpu.toFixed(1)}%</td>
+         <td class="num">${fmtB(p.rss)}</td>${cmdCell(p.cmd || "")}</tr>`).join("")
+    : `<tr><td class="empty" colspan="5">warming up…</td></tr>`);
+}
+
+// ---- dark mode switch: follows the system until toggled, then remembers the choice
+const darkMQ = matchMedia("(prefers-color-scheme: dark)");
+const isDark = () => (document.documentElement.dataset.theme || (darkMQ.matches ? "dark" : "light")) === "dark";
+$("theme").checked = isDark();
+darkMQ.addEventListener("change", () => { $("theme").checked = isDark(); });
+$("theme").addEventListener("change", e => {
+  const t = e.target.checked ? "dark" : "light";
+  document.documentElement.dataset.theme = t;
+  try { localStorage.setItem("theme", t); } catch (err) {}
+});
+
+// ---- stream; disconnect while the tab is hidden so the server stops sampling
+let es = null;
+function connect() {
+  if (es) return;
+  es = new EventSource("/stream");
+  es.onmessage = e => { $("live").classList.add("live"); render(JSON.parse(e.data)); };
+  es.onerror = () => $("live").classList.remove("live");
+}
+function disconnect() { if (es) { es.close(); es = null; $("live").classList.remove("live"); } }
+document.addEventListener("visibilitychange", () => document.hidden ? disconnect() : connect());
+connect();
+</script>
+</body>
+</html>

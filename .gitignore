@@ -1,0 +1,64 @@
+# Local settings and credentials
+.env
+.env.*
+!.env.example
+*.local
+*.local.*
+secrets/
+credentials/
+auth/
+sessions/
+.cookies*
+*.token
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+id_rsa*
+id_ed25519*
+
+# Runtime state, databases, downloaded data and personal records
+*.db
+*.db-*
+*.sqlite*
+*.sql
+*.log
+logs/
+data/
+private/
+records/
+downloads/
+raw/
+backups/
+*.bak
+*.har
+*.pcap*
+
+# Python, dependencies and generated files
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+node_modules/
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage*
+htmlcov/
+coverage/
+
+# Editor and OS files
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+
+# Local reference prompt for a different machine; not application source
+PROMPT-rtx5090.md

@@ -1,0 +1,8 @@
+# Standalone example only. Replace MONITOR_HOSTNAME before use.
+# For a private LAN, clients must trust Caddy's local CA.
+https://MONITOR_HOSTNAME:18888 {
+    tls internal
+    reverse_proxy 127.0.0.1:8765 {
+        flush_interval -1
+    }
+}
