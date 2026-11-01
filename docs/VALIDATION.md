@@ -64,4 +64,4 @@ Validated on **November 1, 2026** against the deployment's vLLM container
 | Unreachable vLLM URL | Passed: yields `up: false` and is hidden while another server is reachable |
 | Frontend rendering | Passed: script syntax check; inference block rendered for vLLM only, Ollama only, both down, and pre-update payloads |
 | Sampling cost | About 6 ms per sample without a process scan, about 30 ms with one |
-| Deployed service | Unit updated with `--vllm http://127.0.0.1:18300`, verified, reloaded, and restarted; HTTP 8888 and HTTPS 18888 serve the new frontend |
+| Deployed service | Unit updated with `--vllm http://127.0.0.1:18300`, verified, reloaded, and restarted; HTTP 8888 serves the new frontend byte-for-byte. No HTTPS listener for this host was found (port 18888 was not open on it), so HTTPS was not checked |
