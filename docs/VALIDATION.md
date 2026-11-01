@@ -49,3 +49,19 @@ for Git. The local RTX 5090 reference prompt and Python cache are excluded.
 No live metrics, process dumps, model inventory, host inventory, credentials,
 TLS material, logs, databases, dependencies, or browser authentication state
 are included. Configuration examples require explicit path/hostname replacement.
+
+## vLLM support update
+
+Validated on **November 1, 2026** against the deployment's vLLM container
+(OpenAI-compatible API on Docker-published port 18300) with Ollama stopped.
+
+| Check | Result |
+| --- | --- |
+| Python syntax and `--help` | Passed; `--vllm` is repeatable and `--ollama ""` disables Ollama polling |
+| vLLM `/v1/models` | Passed: served model and maximum context length reported |
+| vLLM `/metrics` | Passed: running/queued requests, KV-cache usage, and prefix-cache hit rate parsed; token rates appear from the second poll |
+| Prefill rate | Passed: prefix-cache hits are subtracted, so the rate reflects computed prompt tokens |
+| Unreachable vLLM URL | Passed: yields `up: false` and is hidden while another server is reachable |
+| Frontend rendering | Passed: script syntax check; inference block rendered for vLLM only, Ollama only, both down, and pre-update payloads |
+| Sampling cost | About 6 ms per sample without a process scan, about 30 ms with one |
+| Deployed service | Unit updated with `--vllm http://127.0.0.1:18300`, verified, reloaded, and restarted; HTTP 8888 and HTTPS 18888 serve the new frontend |

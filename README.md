@@ -20,7 +20,9 @@ external fonts, database, or build step are required.
 - Optional inference-server integration, for Ollama and vLLM side by side:
   - Ollama: loaded models, memory size, GPU share, context length, and unload time.
   - vLLM: served models, maximum context length, running and queued requests,
-    KV-cache usage, and prompt/generation tokens per second.
+    KV-cache usage, prefix-cache hit rate since vLLM started, and
+    prefill/generation tokens per second. The prefill (“in”) rate excludes
+    prefix-cache hits, so it reflects computed tokens.
   - Only reachable servers are listed, so a host serving with vLLM alone does
     not report Ollama as down. If none respond, one “not reachable” line is shown.
 - Light/dark themes with a saved browser preference, responsive cards,

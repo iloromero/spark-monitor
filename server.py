@@ -331,6 +331,9 @@ VLLM_METRICS = {  # Prometheus series -> field; summed across engines per model
     "vllm:kv_cache_usage_perc": "kv",
     "vllm:gpu_cache_usage_perc": "kv",  # name before vLLM 0.10
     "vllm:prompt_tokens_total": "prompt_tokens",
+    "vllm:prompt_tokens_cached_total": "cached_tokens",  # prefix-cache hits inside prompt_tokens
+    "vllm:prefix_cache_queries_total": "cache_queries",
+    "vllm:prefix_cache_hits_total": "cache_hits",
     "vllm:generation_tokens_total": "gen_tokens",
 }
 
@@ -390,6 +393,9 @@ class VLLM:
             name = m.get("id")
             x = metrics.get(name, {})
             pt, gt = x.get("prompt_tokens"), x.get("gen_tokens")
+            if pt is not None:  # rate only the prefill actually computed, not cache hits
+                pt -= x.get("cached_tokens", 0.0)
+            q = x.get("cache_queries")
             counters[name] = (pt, gt)
             rows.append({
                 "name": name,
@@ -397,6 +403,7 @@ class VLLM:
                 "running": x.get("running"),
                 "waiting": x.get("waiting"),
                 "kv_pct": None if x.get("kv") is None else 100 * x["kv"],
+                "cache_hit_pct": 100 * x.get("cache_hits", 0.0) / q if q else None,
                 "prompt_tps": rate(name, 0, pt),
                 "gen_tps": rate(name, 1, gt),
             })

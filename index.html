@@ -300,6 +300,7 @@ function render(s) {
       v.models.map(m => `<div class="model" title="${esc(v.url)}">
         <b>${esc(m.name)}</b><span>${[ctxK(m.ctx),
           m.kv_pct != null ? `KV cache ${m.kv_pct.toFixed(0)}%` : null,
+          m.cache_hit_pct != null ? `prefix hits ${m.cache_hit_pct.toFixed(0)}%` : null,
           m.gen_tps ? `${tps(m.gen_tps)} tok/s out` : null,
           m.prompt_tps ? `${tps(m.prompt_tps)} tok/s in` : null].filter(Boolean).join(" · ")}</span></div>`).join("");
   }
