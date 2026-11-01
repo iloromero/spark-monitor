@@ -2,7 +2,8 @@
 """Spark Monitor: low-overhead live resource dashboard for an NVIDIA DGX Spark (GB10).
 
 Standard library only. GPU metrics come from NVML via ctypes (no nvidia-smi
-subprocess); everything else is read from /proc and /sys. Sampling runs only
+subprocess); everything else is read from /proc and /sys, plus optional
+Ollama and vLLM HTTP endpoints. Sampling runs only
 while at least one browser is connected, and results stream over SSE.
 """
 import argparse
@@ -287,22 +288,28 @@ class System:
         }
 
 
-# ---------------------------------------------------------------- Ollama
+# ---------------------------------------------------------------- inference servers
+def _get(url, timeout=0.5):
+    with urllib.request.urlopen(url, timeout=timeout) as r:
+        return r.read()
+
+
 class Ollama:
     """Models currently loaded in Ollama, from /api/ps; polled every 3 s."""
 
     def __init__(self, url):
-        self.url = url.rstrip("/") + "/api/ps"
+        self.url = url.rstrip("/") + "/api/ps" if url else None
         self.t = 0
         self.last = None
 
     def sample(self, now):
+        if not self.url:
+            return None
         if now - self.t < 3:
             return self.last
         self.t = now
         try:
-            with urllib.request.urlopen(self.url, timeout=0.5) as r:
-                models = json.load(r).get("models", [])
+            models = json.loads(_get(self.url)).get("models", [])
         except (OSError, ValueError):
             self.last = {"up": False, "models": []}
             return self.last
@@ -318,13 +325,94 @@ class Ollama:
         return self.last
 
 
+VLLM_METRICS = {  # Prometheus series -> field; summed across engines per model
+    "vllm:num_requests_running": "running",
+    "vllm:num_requests_waiting": "waiting",
+    "vllm:kv_cache_usage_perc": "kv",
+    "vllm:gpu_cache_usage_perc": "kv",  # name before vLLM 0.10
+    "vllm:prompt_tokens_total": "prompt_tokens",
+    "vllm:generation_tokens_total": "gen_tokens",
+}
+
+
+def _prom(text):
+    """{model_name: {field: value}} for the VLLM_METRICS series in a /metrics body."""
+    out = {}
+    for line in text.splitlines():
+        name, sep, rest = line.partition("{")
+        field = VLLM_METRICS.get(name)
+        if not field or not sep:
+            continue
+        labels, _, value = rest.rpartition("}")
+        model = next((kv.split("=", 1)[1].strip('"') for kv in labels.split(",")
+                      if kv.startswith("model_name=")), "?")
+        try:
+            v = float(value.split()[0])
+        except (ValueError, IndexError):
+            continue
+        m = out.setdefault(model, {})
+        m[field] = m.get(field, 0.0) + v
+    return out
+
+
+class VLLM:
+    """Models served by a vLLM OpenAI-compatible server, from /v1/models and
+    /metrics (load, KV cache, token throughput); polled every 3 s."""
+
+    def __init__(self, url):
+        self.base = url.rstrip("/")
+        self.t = 0
+        self.last = None
+        self.prev = None  # (t, {model: (prompt_tokens, gen_tokens)}) for rates
+
+    def sample(self, now):
+        if now - self.t < 3:
+            return self.last
+        self.t = now
+        try:
+            models = json.loads(_get(self.base + "/v1/models")).get("data", [])
+        except (OSError, ValueError):
+            self.last, self.prev = {"up": False, "url": self.base, "models": []}, None
+            return self.last
+        try:
+            metrics = _prom(_get(self.base + "/metrics").decode("utf-8", "replace"))
+        except OSError:  # metrics can be disabled; the model list still counts as up
+            metrics = {}
+        dt = now - self.prev[0] if self.prev else None
+        prev = self.prev[1] if self.prev else {}
+
+        def rate(name, i, cur):
+            p = prev.get(name)
+            return None if not dt or p is None or cur is None or cur < p[i] else (cur - p[i]) / dt
+
+        rows, counters = [], {}
+        for m in models:
+            name = m.get("id")
+            x = metrics.get(name, {})
+            pt, gt = x.get("prompt_tokens"), x.get("gen_tokens")
+            counters[name] = (pt, gt)
+            rows.append({
+                "name": name,
+                "ctx": m.get("max_model_len"),
+                "running": x.get("running"),
+                "waiting": x.get("waiting"),
+                "kv_pct": None if x.get("kv") is None else 100 * x["kv"],
+                "prompt_tps": rate(name, 0, pt),
+                "gen_tps": rate(name, 1, gt),
+            })
+        self.prev = (now, counters)
+        self.last = {"up": True, "url": self.base, "models": rows}
+        return self.last
+
+
 # ---------------------------------------------------------------- sampler + HTTP
 class Sampler:
-    def __init__(self, interval, ollama_url, power_max):
+    def __init__(self, interval, ollama_url, vllm_urls, power_max):
         self.interval = interval
         self.gpu = GPU(power_max)
         self.sys = System()
         self.ollama = Ollama(ollama_url)
+        self.vllm = [VLLM(u) for u in vllm_urls if u]
         self.cond = threading.Condition()
         self.latest = None
         self.seq = 0
@@ -340,6 +428,7 @@ class Sampler:
             data = self.sys.sample()
             data["gpu"] = self.gpu.sample()
             data["ollama"] = self.ollama.sample(t0)
+            data["vllm"] = [v.sample(t0) for v in self.vllm]
             data["ts"] = time.time()
             data["sample_ms"] = (time.monotonic() - t0) * 1000
             with self.cond:
@@ -397,11 +486,15 @@ def main():
     ap.add_argument("--host", default="127.0.0.1", help="bind address (default: localhost only)")
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--interval", type=float, default=1.0, help="seconds between samples")
-    ap.add_argument("--ollama", default="http://127.0.0.1:11434", help="Ollama base URL")
+    ap.add_argument("--ollama", default="http://127.0.0.1:11434", help="Ollama base URL; empty string disables")
+    ap.add_argument("--vllm", action="append", metavar="URL",
+                    help="vLLM base URL; repeat for several servers (default: http://127.0.0.1:8000); "
+                         "empty string disables")
     ap.add_argument("--power-max", type=float, default=140.0,
                     help="watts shown as 100%% on the power dial when NVML reports no limit (GB10 TDP: 140)")
     a = ap.parse_args()
-    Handler.sampler = Sampler(a.interval, a.ollama, a.power_max)
+    vllm = a.vllm if a.vllm is not None else ["http://127.0.0.1:8000"]
+    Handler.sampler = Sampler(a.interval, a.ollama, vllm, a.power_max)
     srv = ThreadingHTTPServer((a.host, a.port), Handler)
     srv.daemon_threads = True
     print(f"Spark Monitor on http://{a.host}:{a.port}  (GPU via NVML: {Handler.sampler.gpu.ok})")

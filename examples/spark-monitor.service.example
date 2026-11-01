@@ -4,7 +4,7 @@ Description=Spark Monitor live resource dashboard
 After=network.target
 
 [Service]
-ExecStart=/usr/bin/python3 /APP_DIRECTORY/server.py --host 127.0.0.1 --port 8765 --interval 1 --ollama http://127.0.0.1:11434 --power-max 140
+ExecStart=/usr/bin/python3 /APP_DIRECTORY/server.py --host 127.0.0.1 --port 8765 --interval 1 --ollama http://127.0.0.1:11434 --vllm http://127.0.0.1:8000 --power-max 140
 Restart=on-failure
 Nice=10
 

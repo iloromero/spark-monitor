@@ -277,19 +277,37 @@ function render(s) {
         <span>${c.util.toFixed(0)}</span></div>`).join("")}</div>`;
   }).join("") || `<div class="empty">warming up…</div>`;
 
-  // Ollama loaded models (shown in the unified memory card)
-  const o = s.ollama;
-  let ollamaHtml = "";
-  if (o) {
+  // inference servers (shown in the unified memory card): only reachable ones are listed,
+  // so a machine serving with vLLM alone does not report Ollama as down (and vice versa)
+  const o = s.ollama, vl = s.vllm || [];
+  const ctxK = c => c ? `${Math.round(c / 1024)}k ctx` : null;
+  const tps = v => v >= 100 ? v.toFixed(0) : v.toFixed(1);
+  let inferHtml = "";
+  if (o?.up) {
     const total = o.models.reduce((a, m) => a + m.size, 0);
     const until = t => { const m = Math.round((new Date(t) - Date.now()) / 60000); return m > 0 ? `unloads in ${m} min` : "unloading"; };
-    ollamaHtml = `<div class="models"><div class="cluster"><span>Ollama</span><span>${
-      !o.up ? "not reachable" : o.models.length ? `${o.models.length} loaded · ${fmtB(total)}` : "no models loaded"}</span></div>` +
+    inferHtml += `<div class="cluster"><span>Ollama</span><span>${
+      o.models.length ? `${o.models.length} loaded · ${fmtB(total)}` : "no models loaded"}</span></div>` +
       o.models.map(m => `<div class="model" title="${esc([m.params, m.quant].filter(Boolean).join(" · "))}">
         <b>${esc(m.name)}</b><span>${fmtB(m.size)} · ${m.size ? Math.round(100 * m.size_vram / m.size) : 0}% GPU${
-          m.ctx ? ` · ${Math.round(m.ctx / 1024)}k ctx` : ""}${m.expires ? " · " + until(m.expires) : ""}</span></div>`).join("") +
-      `</div>`;
+          m.ctx ? " · " + ctxK(m.ctx) : ""}${m.expires ? " · " + until(m.expires) : ""}</span></div>`).join("");
   }
+  for (const v of vl.filter(v => v?.up)) {
+    const sum = k => v.models.reduce((a, m) => a + (m[k] || 0), 0);
+    const queued = sum("waiting");
+    inferHtml += `<div class="cluster"><span title="${esc(v.url)}">vLLM</span><span>${
+      v.models.length ? `${sum("running")} running${queued ? ` · ${queued} queued` : ""}` : "no models served"}</span></div>` +
+      v.models.map(m => `<div class="model" title="${esc(v.url)}">
+        <b>${esc(m.name)}</b><span>${[ctxK(m.ctx),
+          m.kv_pct != null ? `KV cache ${m.kv_pct.toFixed(0)}%` : null,
+          m.gen_tps ? `${tps(m.gen_tps)} tok/s out` : null,
+          m.prompt_tps ? `${tps(m.prompt_tps)} tok/s in` : null].filter(Boolean).join(" · ")}</span></div>`).join("");
+  }
+  if (!inferHtml && (o || vl.length)) {
+    inferHtml = `<div class="cluster"><span>Inference</span><span>${
+      [o && "Ollama", vl.length && "vLLM"].filter(Boolean).join(" / ")} not reachable</span></div>`;
+  }
+  if (inferHtml) inferHtml = `<div class="models">${inferHtml}</div>`;
 
   // memory: stacked bar of where the shared 128 GB goes
   const gpuMem = Math.min(mem.resident, g ? g.procs.reduce((a, p) => a + (p.gpu_mem || 0), 0) : 0);
@@ -306,7 +324,7 @@ function render(s) {
     `<div class="stack">${segs.slice(0, 4).map(([k, v, c]) =>
       `<i style="width:${100 * v / mem.total}%;background:${c}" title="${k} ${fmtB(v)}"></i>`).join("")}</div>
      <div class="mlegend">${segs.map(([k, v, c]) => `<span><b style="background:${c}"></b>${k} ${fmtB(v)}</span>`).join("")}
-       <span class="meta">available ${fmtB(mem.avail)} · swap ${fmtB(mem.swap_used)} (${swapPct.toFixed(1)}%)</span></div>` + ollamaHtml;
+       <span class="meta">available ${fmtB(mem.avail)} · swap ${fmtB(mem.swap_used)} (${swapPct.toFixed(1)}%)</span></div>` + inferHtml;
 
   // GPU
   push("power", g?.power_w);

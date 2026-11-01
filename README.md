@@ -17,12 +17,16 @@ external fonts, database, or build step are required.
   process allocations through NVML, without spawning `nvidia-smi` per sample.
 - Disk throughput, active physical network interfaces, GPU/SoC/NVMe/ConnectX
   temperatures, load averages, uptime, and the top eight CPU processes.
-- Optional Ollama integration: loaded models, memory size, GPU share,
-  context length, and unload time.
+- Optional inference-server integration, for Ollama and vLLM side by side:
+  - Ollama: loaded models, memory size, GPU share, context length, and unload time.
+  - vLLM: served models, maximum context length, running and queued requests,
+    KV-cache usage, and prompt/generation tokens per second.
+  - Only reachable servers are listed, so a host serving with vLLM alone does
+    not report Ollama as down. If none respond, one “not reachable” line is shown.
 - Light/dark themes with a saved browser preference, responsive cards,
   scrollable process tables, and 120-sample sparklines.
 - On-demand sampling: the sampler waits without clients; hidden tabs close
-  their stream. Process scans and Ollama polling run at most once per three seconds.
+  their stream. Process scans and inference-server polling run at most once per three seconds.
 
 ![Spark Monitor with entirely synthetic demonstration metrics](docs/screenshot.png)
 
@@ -38,12 +42,12 @@ no live machine records or credentials are included.*
 | Linux collectors | Read-only access to `/proc`, `/sys`, and filesystem statistics |
 | Transport | Server-Sent Events (SSE), JSON at `/stream` |
 | Frontend | Plain HTML, CSS, JavaScript, and inline SVG in `index.html` |
-| Optional integration | Ollama HTTP `GET /api/ps` |
+| Optional integrations | Ollama HTTP `GET /api/ps`; vLLM `GET /v1/models` and `GET /metrics` |
 | Background service | systemd user service |
 | Existing HTTPS | External Caddy reverse proxy managed with the local MyApps setup |
 
-`Sampler` owns one GPU collector, one system collector, and one Ollama
-collector. A daemon thread produces a shared JSON snapshot while clients are
+`Sampler` owns one GPU collector, one system collector, one Ollama collector,
+and one vLLM collector per configured vLLM URL. A daemon thread produces a shared JSON snapshot while clients are
 connected; a condition variable distributes updates to SSE request threads.
 The frontend uses `EventSource`, renders the snapshot, and retains only a
 rolling history in the browser. The backend does not persist samples.
@@ -64,7 +68,8 @@ examples/Caddyfile.example             optional HTTPS example
 - NVIDIA driver and its NVML shared library for GPU data. No NVIDIA Python
   package or CUDA toolkit is required by this app.
 - A modern browser supporting SSE, SVG, CSS Grid, and `color-mix()`.
-- Optional Ollama server; the default endpoint is `http://127.0.0.1:11434`.
+- Optional Ollama server (default `http://127.0.0.1:11434`) and/or vLLM
+  OpenAI-compatible server (default `http://127.0.0.1:8000`).
 - Optional systemd and Caddy for service management and HTTPS.
 
 **The app needs no API keys, passwords, tokens, or database credentials.**
@@ -106,17 +111,25 @@ The examples contain placeholders and local addresses, never credentials.
 | `--host` | `127.0.0.1` | Listener address; `0.0.0.0` exposes all IPv4 interfaces |
 | `--port` | `8765` | HTTP port |
 | `--interval` | `1.0` | Seconds between samples; use a positive value |
-| `--ollama` | `http://127.0.0.1:11434` | Ollama base URL; `/api/ps` is appended |
+| `--ollama` | `http://127.0.0.1:11434` | Ollama base URL; `/api/ps` is appended; `""` disables |
+| `--vllm` | `http://127.0.0.1:8000` | vLLM base URL; repeat for several servers; `""` disables |
 | `--power-max` | `140.0` | Gauge scale in watts if NVML reports no enforced limit |
 
-For an Ollama server on another trusted host, replace `OLLAMA_HOSTNAME`:
+For inference servers on another trusted host or port, replace the placeholders.
+vLLM in Docker is usually published on a host port other than 8000, so pass
+that port:
 
 ```bash
-python3 server.py --ollama http://OLLAMA_HOSTNAME:11434 --power-max 140
+python3 server.py --ollama http://OLLAMA_HOSTNAME:11434 \
+  --vllm http://127.0.0.1:VLLM_HOST_PORT --vllm http://VLLM_HOSTNAME:8000
 ```
 
-Ollama requests have a 0.5-second timeout and run at most every three seconds.
-A stopped Ollama is displayed as “not reachable”; monitoring continues.
+Each request has a 0.5-second timeout and runs at most every three seconds.
+Servers that do not respond are hidden while another one is reachable; when
+none respond, the memory card shows “Ollama / vLLM not reachable”. Monitoring
+continues either way. Token rates come from differences between vLLM counters,
+so they appear from the second poll onward. If `/metrics` is unavailable, the
+model list is still shown.
 
 ## Existing deployment, HTTPS, and schedules
 
@@ -124,8 +137,11 @@ The original machine already runs `spark-monitor.service` as a systemd **user**
 service. The checked-in original unit starts:
 
 ```text
-/usr/bin/python3 %h/Projects/spark-monitor/server.py --host 0.0.0.0 --port 8888
+/usr/bin/python3 %h/Projects/spark-monitor/server.py --host 0.0.0.0 --port 8888 --vllm http://127.0.0.1:18300
 ```
+
+Port 18300 is the host port Docker publishes for the vLLM container on that
+machine.
 
 It uses `Nice=10`, restarts on failure, and is enabled through the user's
 default target. The source location is significant because the unit references
@@ -206,7 +222,7 @@ they contain process command lines and local workload details.
 
 Publication checks and any environment-dependent gaps are recorded in
 [docs/VALIDATION.md](docs/VALIDATION.md). Hardware checks require readable Linux
-interfaces and an NVIDIA driver. Ollama, systemd, and TLS checks require those
+interfaces and an NVIDIA driver. Ollama, vLLM, systemd, and TLS checks require those
 external services; they are separate from Python syntax and isolated HTTP checks.
 
 ## Troubleshooting
@@ -218,6 +234,8 @@ external services; they are separate from Python syntax and isolated HTTP checks
 | NVML error or stopped updates | Confirm the installed driver exposes the NVML functions used in `GPU`; not every ABI failure is handled |
 | CPU/rate fields initially blank | Wait for successive samples; utilization is calculated from counter deltas |
 | No Ollama models | Ensure Ollama is reachable at the configured URL; `/api/ps` lists loaded models, not all installed models |
+| vLLM missing or “not reachable” | `curl http://HOST:PORT/v1/models` against the `--vllm` URL; for Docker, use the published host port |
+| vLLM shows no KV cache or tok/s | `/metrics` is not reachable or the vLLM version uses different series names; rates also need two polls |
 | HTTPS certificate warning | Trust the deployment's private CA through your device's trusted certificate settings |
 | HTTPS page loads but no updates | Confirm the proxy streams `/stream` without buffering and allows long-lived requests |
 | Updates stop in a hidden tab | Expected: reopening the tab reconnects; all disconnected clients allow sampling to stop |
@@ -241,5 +259,8 @@ external services; they are separate from Python syntax and isolated HTTP checks
   production hardening. Process arguments can contain sensitive information.
 - Sparklines hold 120 samples: approximately two minutes at the default interval;
   history disappears on reload. There is no alerting, export, or historical database.
-- Low overhead is a design goal, not a portable benchmark guarantee. Ollama
+- vLLM figures are read from Prometheus series names used by current vLLM
+  releases (`vllm:kv_cache_usage_perc`, or `vllm:gpu_cache_usage_perc` on older
+  ones); renamed series show as blank rather than as errors.
+- Low overhead is a design goal, not a portable benchmark guarantee. Inference-server
   timeouts, number of processes, browser clients, and hardware affect sampling cost.

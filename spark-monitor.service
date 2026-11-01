@@ -3,7 +3,7 @@ Description=Spark Monitor live resource dashboard
 After=network.target
 
 [Service]
-ExecStart=/usr/bin/python3 %h/Projects/spark-monitor/server.py --host 0.0.0.0 --port 8888
+ExecStart=/usr/bin/python3 %h/Projects/spark-monitor/server.py --host 0.0.0.0 --port 8888 --vllm http://127.0.0.1:18300
 Restart=on-failure
 Nice=10
 
