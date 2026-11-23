@@ -295,7 +295,7 @@ function render(s) {
   for (const v of vl.filter(v => v?.up)) {
     const sum = k => v.models.reduce((a, m) => a + (m[k] || 0), 0);
     const queued = sum("waiting");
-    inferHtml += `<div class="cluster"><span title="${esc(v.url)}">vLLM</span><span>${
+    inferHtml += `<div class="cluster"><span title="${esc(v.url)}">${esc(v.label || "vLLM")}</span><span>${
       v.models.length ? `${sum("running")} running${queued ? ` · ${queued} queued` : ""}` : "no models served"}</span></div>` +
       v.models.map(m => `<div class="model" title="${esc(v.url)}">
         <b>${esc(m.name)}</b><span>${[ctxK(m.ctx),

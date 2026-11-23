@@ -114,7 +114,7 @@ The examples contain placeholders and local addresses, never credentials.
 | `--port` | `8765` | HTTP port |
 | `--interval` | `1.0` | Seconds between samples; use a positive value |
 | `--ollama` | `http://127.0.0.1:11434` | Ollama base URL; `/api/ps` is appended; `""` disables |
-| `--vllm` | `http://127.0.0.1:8000` | vLLM base URL; repeat for several servers; `""` disables |
+| `--vllm` | `http://127.0.0.1:8000` | vLLM base URL, optionally `LABEL=URL` (the label replaces "vLLM" in the panel, e.g. `"vLLM · TP2 cluster=http://127.0.0.1:21888"`); repeat for several servers; unreachable ones are hidden; `""` disables |
 | `--power-max` | `140.0` | Gauge scale in watts if NVML reports no enforced limit |
 
 For inference servers on another trusted host or port, replace the placeholders.

@@ -363,6 +363,13 @@ class VLLM:
     /metrics (load, KV cache, token throughput); polled every 3 s."""
 
     def __init__(self, url):
+        # optional display label: "TP2 cluster=http://host:port"
+        label, sep, rest = url.partition("=")
+        if sep and not label.startswith("http"):
+            url = rest
+        else:
+            label = "vLLM"
+        self.label = label
         self.base = url.rstrip("/")
         self.t = 0
         self.last = None
@@ -375,7 +382,7 @@ class VLLM:
         try:
             models = json.loads(_get(self.base + "/v1/models")).get("data", [])
         except (OSError, ValueError):
-            self.last, self.prev = {"up": False, "url": self.base, "models": []}, None
+            self.last, self.prev = {"up": False, "url": self.base, "label": self.label, "models": []}, None
             return self.last
         try:
             metrics = _prom(_get(self.base + "/metrics").decode("utf-8", "replace"))
@@ -408,7 +415,7 @@ class VLLM:
                 "gen_tps": rate(name, 1, gt),
             })
         self.prev = (now, counters)
-        self.last = {"up": True, "url": self.base, "models": rows}
+        self.last = {"up": True, "url": self.base, "label": self.label, "models": rows}
         return self.last
 
 
@@ -495,8 +502,8 @@ def main():
     ap.add_argument("--interval", type=float, default=1.0, help="seconds between samples")
     ap.add_argument("--ollama", default="http://127.0.0.1:11434", help="Ollama base URL; empty string disables")
     ap.add_argument("--vllm", action="append", metavar="URL",
-                    help="vLLM base URL; repeat for several servers (default: http://127.0.0.1:8000); "
-                         "empty string disables")
+                    help="vLLM base URL, optionally LABEL=URL (label shown instead of 'vLLM'); repeat for "
+                         "several servers (default: http://127.0.0.1:8000); empty string disables")
     ap.add_argument("--power-max", type=float, default=140.0,
                     help="watts shown as 100%% on the power dial when NVML reports no limit (GB10 TDP: 140)")
     a = ap.parse_args()
