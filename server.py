@@ -11,6 +11,7 @@ import ctypes
 import json
 import os
 import threading
+import traceback
 import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -393,7 +394,9 @@ class VLLM:
 
         def rate(name, i, cur):
             p = prev.get(name)
-            return None if not dt or p is None or cur is None or cur < p[i] else (cur - p[i]) / dt
+            if not dt or p is None or cur is None or p[i] is None or cur < p[i]:
+                return None  # no baseline yet (first sample, counter missing last time, or server restarted)
+            return (cur - p[i]) / dt
 
         rows, counters = [], {}
         for m in models:
@@ -420,6 +423,15 @@ class VLLM:
 
 
 # ---------------------------------------------------------------- sampler + HTTP
+def _safe(fn, t0, fallback):
+    """One source's sample; on an unexpected error, log it and report that source as down for this tick."""
+    try:
+        return fn(t0)
+    except Exception:  # noqa: BLE001
+        traceback.print_exc()
+        return fallback
+
+
 class Sampler:
     def __init__(self, interval, ollama_url, vllm_urls, power_max):
         self.interval = interval
@@ -439,10 +451,16 @@ class Sampler:
                 while self.clients == 0:
                     self.cond.wait()
             t0 = time.monotonic()
-            data = self.sys.sample()
-            data["gpu"] = self.gpu.sample()
-            data["ollama"] = self.ollama.sample(t0)
-            data["vllm"] = [v.sample(t0) for v in self.vllm]
+            try:
+                data = self.sys.sample()
+                data["gpu"] = self.gpu.sample()
+                data["ollama"] = _safe(self.ollama.sample, t0, {"up": False})
+                data["vllm"] = [_safe(v.sample, t0, {"up": False, "url": v.base, "label": v.label, "models": []})
+                                for v in self.vllm]
+            except Exception:  # noqa: BLE001 - a failed sample must never stop the stream
+                traceback.print_exc()
+                time.sleep(self.interval)
+                continue
             data["ts"] = time.time()
             data["sample_ms"] = (time.monotonic() - t0) * 1000
             with self.cond:
