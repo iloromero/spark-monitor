@@ -1,6 +1,7 @@
 # Spark Monitor
 
-A lightweight, live resource dashboard for an **NVIDIA DGX Spark (GB10)**.
+A lightweight, live resource dashboard for NVIDIA Linux systems, including
+the **NVIDIA DGX Spark (GB10)** and workstations with discrete NVIDIA GPUs.
 One Python process collects Linux and NVIDIA metrics and streams them to a
 self-contained browser interface. No pip packages, frontend dependencies,
 external fonts, database, or build step are required.
@@ -17,14 +18,15 @@ external fonts, database, or build step are required.
   process allocations through NVML, without spawning `nvidia-smi` per sample.
 - Disk throughput, active physical network interfaces, GPU/SoC/NVMe/ConnectX
   temperatures, load averages, uptime, and the top eight CPU processes.
-- Optional inference-server integration, for Ollama and vLLM side by side:
+- Optional inference-server integration:
   - Ollama: loaded models, memory size, GPU share, context length, and unload time.
   - vLLM: served models, maximum context length, running and queued requests,
     KV-cache usage, prefix-cache hit rate since vLLM started, and
     prefill/generation tokens per second. The prefill (“in”) rate excludes
     prefix-cache hits, so it reflects computed tokens.
-  - Only reachable servers are listed, so a host serving with vLLM alone does
-    not report Ollama as down. If none respond, one “not reachable” line is shown.
+  - llama.cpp: served model, active and queued requests, and prompt/generation
+    throughput. Workstations can display GPU VRAM separately from system RAM.
+  - Reachable servers are listed. If none respond, one “not reachable” line is shown.
 - Light/dark themes with a saved browser preference, responsive cards,
   scrollable process tables, and 120-sample sparklines.
 - On-demand sampling: the sampler waits without clients; hidden tabs close
@@ -44,12 +46,12 @@ no live machine records or credentials are included.*
 | Linux collectors | Read-only access to `/proc`, `/sys`, and filesystem statistics |
 | Transport | Server-Sent Events (SSE), JSON at `/stream` |
 | Frontend | Plain HTML, CSS, JavaScript, and inline SVG in `index.html` |
-| Optional integrations | Ollama HTTP `GET /api/ps`; vLLM `GET /v1/models` and `GET /metrics` |
+| Optional integrations | Ollama `GET /api/ps`; vLLM and llama.cpp `GET /v1/models` and `GET /metrics`; llama.cpp fallback `GET /slots` |
 | Background service | systemd user service |
 | Existing HTTPS | External Caddy reverse proxy managed with the local MyApps setup |
 
-`Sampler` owns one GPU collector, one system collector, one Ollama collector,
-and one vLLM collector per configured vLLM URL. A daemon thread produces a shared JSON snapshot while clients are
+`Sampler` owns the hardware and configured inference-server collectors.
+A daemon thread produces a shared JSON snapshot while clients are
 connected; a condition variable distributes updates to SSE request threads.
 The frontend uses `EventSource`, renders the snapshot, and retains only a
 rolling history in the browser. The backend does not persist samples.
@@ -70,12 +72,12 @@ examples/Caddyfile.example             optional HTTPS example
 - NVIDIA driver and its NVML shared library for GPU data. No NVIDIA Python
   package or CUDA toolkit is required by this app.
 - A modern browser supporting SSE, SVG, CSS Grid, and `color-mix()`.
-- Optional Ollama server (default `http://127.0.0.1:11434`) and/or vLLM
-  OpenAI-compatible server (default `http://127.0.0.1:8000`).
+- Optional Ollama server (default `http://127.0.0.1:11434`), vLLM
+  (default `http://127.0.0.1:8000`), or llama.cpp server (disabled by default).
 - Optional systemd and Caddy for service management and HTTPS.
 
-**The app needs no API keys, passwords, tokens, or database credentials.**
-It has no login or authorization layer. Anyone who can reach the listener can
+The optional llama.cpp integration can read a bearer key from a local file.
+The dashboard has no login or authorization layer. Anyone who can reach the listener can
 see machine metrics, process names and command lines, and loaded model names.
 Use localhost, a trusted LAN, or an appropriately protected reverse proxy.
 HTTPS encrypts traffic but does not add authentication. TLS keys and CA material
@@ -113,8 +115,12 @@ The examples contain placeholders and local addresses, never credentials.
 | `--host` | `127.0.0.1` | Listener address; `0.0.0.0` exposes all IPv4 interfaces |
 | `--port` | `8765` | HTTP port |
 | `--interval` | `1.0` | Seconds between samples; use a positive value |
+| `--title` | `Spark Monitor` | Dashboard and tab title |
+| `--discrete-gpu` | off | Display system RAM and GPU VRAM separately |
 | `--ollama` | `http://127.0.0.1:11434` | Ollama base URL; `/api/ps` is appended; `""` disables |
 | `--vllm` | `http://127.0.0.1:8000` | vLLM base URL, optionally `LABEL=URL` (the label replaces "vLLM" in the panel, e.g. `"vLLM · TP2 cluster=http://127.0.0.1:21888"`); repeat for several servers; unreachable ones are hidden; `""` disables |
+| `--llamacpp` | disabled | Base URL of a llama.cpp server running a single model |
+| `--llamacpp-api-key-file` | unset | Path to a file containing the llama.cpp server's bearer key |
 | `--power-max` | `140.0` | Gauge scale in watts if NVML reports no enforced limit |
 
 For inference servers on another trusted host or port, replace the placeholders.
@@ -128,10 +134,23 @@ python3 server.py --ollama http://OLLAMA_HOSTNAME:11434 \
 
 Each request has a 0.5-second timeout and runs at most every three seconds.
 Servers that do not respond are hidden while another one is reachable; when
-none respond, the memory card shows “Ollama / vLLM not reachable”. Monitoring
+none respond, the memory card lists the configured providers as unreachable. Monitoring
 continues either way. Token rates come from differences between vLLM counters,
 so they appear from the second poll onward. If `/metrics` is unavailable, the
 model list is still shown.
+
+For a workstation serving a model with llama.cpp:
+
+```bash
+python3 server.py --title "Workstation Monitor" --discrete-gpu --interval 3 \
+  --ollama "" --vllm "" --llamacpp http://127.0.0.1:18300
+```
+
+Add `--llamacpp-api-key-file /path/to/key` for a protected endpoint. The
+monitor only reads metadata and metrics. llama.cpp must be started with
+[`--metrics`](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md#get-metrics-prometheus-compatible-metrics-exporter)
+to show queued requests and throughput. When `/metrics` is disabled, the
+monitor reads `/slots` for active requests and context size if available.
 
 ## Existing deployment, HTTPS, and schedules
 

@@ -3,19 +3,22 @@
 
 Standard library only. GPU metrics come from NVML via ctypes (no nvidia-smi
 subprocess); everything else is read from /proc and /sys, plus optional
-Ollama and vLLM HTTP endpoints. Sampling runs only
+Ollama, vLLM, and llama.cpp HTTP endpoints. Sampling runs only
 while at least one browser is connected, and results stream over SSE.
 """
 import argparse
 import ctypes
 import json
+import math
 import os
 import threading
 import traceback
 import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from html import escape
 from pathlib import Path
+from urllib.error import HTTPError
 
 HERE = Path(__file__).resolve().parent
 CLK_TCK = os.sysconf("SC_CLK_TCK")
@@ -32,13 +35,19 @@ class _Proc(ctypes.Structure):
                 ("gpuInstanceId", ctypes.c_uint), ("computeInstanceId", ctypes.c_uint)]
 
 
+class _Memory(ctypes.Structure):
+    _fields_ = [("total", ctypes.c_ulonglong), ("free", ctypes.c_ulonglong),
+                ("used", ctypes.c_ulonglong)]
+
+
 NVML_NOT_AVAILABLE = 0xFFFFFFFFFFFFFFFF
 
 
 class GPU:
-    def __init__(self, power_max):
+    def __init__(self, power_max, discrete=False):
         self.ok = False
         self.power_max = power_max
+        self.discrete = discrete
         try:
             self.lib = ctypes.CDLL("libnvidia-ml.so.1")
             if self.lib.nvmlInit_v2() != 0:
@@ -67,6 +76,12 @@ class GPU:
         return [(arr[i].pid, None if arr[i].usedGpuMemory == NVML_NOT_AVAILABLE
                  else arr[i].usedGpuMemory) for i in range(n.value)]
 
+    def _memory(self):
+        mem = _Memory()
+        if self.lib.nvmlDeviceGetMemoryInfo(self.h, ctypes.byref(mem)) == 0:
+            return {"total": mem.total, "used": mem.used}
+        return None
+
     def sample(self):
         if not self.ok:
             return None
@@ -90,6 +105,7 @@ class GPU:
             "sm_mhz": self._uint("nvmlDeviceGetClockInfo", 1),
             "sm_max_mhz": self.max_sm,
             "pstate": None if pstate is None or pstate == 32 else f"P{pstate}",
+            **({"memory": self._memory()} if self.discrete else {}),
             "procs": [dict(_proc_info(pid, mem), kind=kind) for pid, (mem, kind) in procs.items()],
         }
 
@@ -109,7 +125,16 @@ def _proc_info(pid, gpu_mem):
         if line.startswith("VmRSS:"):
             rss = int(line.split()[1]) * 1024
             break
-    cmd = (_read(f"/proc/{pid}/cmdline", "") or "").replace("\0", " ").strip()
+    args = iter((_read(f"/proc/{pid}/cmdline", "") or "").rstrip("\0").split("\0"))
+    safe_args = []
+    for arg in args:
+        name, sep, _ = arg.partition("=")
+        if name == "--api-key":
+            if not sep:
+                next(args, None)
+            arg = "--api-key=[redacted]"
+        safe_args.append(arg)
+    cmd = " ".join(safe_args).strip()
     name = (_read(f"/proc/{pid}/comm", "") or "?").strip()
     return {"pid": pid, "name": name, "cmd": cmd[:160], "rss": rss, "gpu_mem": gpu_mem}
 
@@ -290,8 +315,11 @@ class System:
 
 
 # ---------------------------------------------------------------- inference servers
-def _get(url, timeout=0.5):
-    with urllib.request.urlopen(url, timeout=timeout) as r:
+def _get(url, timeout=0.5, *, headers=None):
+    request = urllib.request.Request(url)
+    for name, value in (headers or {}).items():
+        request.add_unredirected_header(name, value)
+    with urllib.request.urlopen(request, timeout=timeout) as r:
         return r.read()
 
 
@@ -422,6 +450,87 @@ class VLLM:
         return self.last
 
 
+LLAMACPP_METRICS = {
+    "llamacpp:requests_processing": "running",
+    "llamacpp:requests_deferred": "waiting",
+    "llamacpp:prompt_tokens_seconds": "prompt_tps",
+    "llamacpp:predicted_tokens_seconds": "gen_tps",
+}
+
+
+class LlamaCpp:
+    """Read model metadata and optional metrics from a single-model llama-server."""
+
+    def __init__(self, url, api_key):
+        self.base = url.rstrip("/").removesuffix("/v1")
+        self.headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+        self.last = self.offline()
+        self.t = float("-inf")
+        self.retry_metrics_at = float("-inf")
+
+    def offline(self):
+        return {"up": False, "url": self.base, "label": "llama.cpp", "models": []}
+
+    def _metrics(self, now):
+        if now < self.retry_metrics_at:
+            return {}
+        try:
+            body = _get(self.base + "/metrics", headers=self.headers).decode("utf-8", "replace")
+        except HTTPError as exc:
+            if exc.code in (404, 501):  # disabled on this instance; check again after a minute
+                self.retry_metrics_at = now + 60
+            return {}
+        except OSError:
+            return {}
+        metrics = {}
+        for line in body.splitlines():
+            fields = line.split()
+            if len(fields) < 2 or fields[0] not in LLAMACPP_METRICS:
+                continue
+            try:
+                value = float(fields[1])
+            except ValueError:
+                continue
+            if math.isfinite(value):
+                metrics[LLAMACPP_METRICS[fields[0]]] = value
+        return metrics
+
+    def _slots(self):
+        try:
+            slots = json.loads(_get(self.base + "/slots", headers=self.headers))
+        except (OSError, ValueError):
+            return {}
+        if not isinstance(slots, list) or not slots or not all(isinstance(s, dict) for s in slots):
+            return {}
+        stats = {}
+        if all(isinstance(s.get("is_processing"), bool) for s in slots):
+            stats["running"] = sum(s["is_processing"] for s in slots)
+        contexts = {s["n_ctx"] for s in slots if isinstance(s.get("n_ctx"), int) and s["n_ctx"] > 0}
+        if len(contexts) == 1:
+            stats["ctx"] = contexts.pop()
+        return stats
+
+    def sample(self, now):
+        if now - self.t < 3:
+            return self.last
+        self.t = now
+        try:
+            models = json.loads(_get(self.base + "/v1/models", headers=self.headers)).get("data", [])
+        except (OSError, ValueError):
+            self.last = self.offline()
+            return self.last
+        metrics = {}
+        if len(models) == 1:
+            metrics = self._metrics(now)
+            if not metrics:
+                metrics = self._slots()
+        self.last = {
+            "up": True, "url": self.base, "label": "llama.cpp",
+            "models": [{"name": model.get("id"), **metrics} for model in models],
+        }
+        return self.last
+
+
 # ---------------------------------------------------------------- sampler + HTTP
 def _safe(fn, t0, fallback):
     """One source's sample; on an unexpected error, log it and report that source as down for this tick."""
@@ -433,12 +542,14 @@ def _safe(fn, t0, fallback):
 
 
 class Sampler:
-    def __init__(self, interval, ollama_url, vllm_urls, power_max):
+    def __init__(self, interval, ollama_url, vllm_urls, power_max, llamacpp=None, discrete_gpu=False):
         self.interval = interval
-        self.gpu = GPU(power_max)
+        self.gpu = GPU(power_max, discrete_gpu)
         self.sys = System()
         self.ollama = Ollama(ollama_url)
         self.vllm = [VLLM(u) for u in vllm_urls if u]
+        self.llamacpp = llamacpp
+        self.discrete_gpu = discrete_gpu
         self.cond = threading.Condition()
         self.latest = None
         self.seq = 0
@@ -454,9 +565,13 @@ class Sampler:
             try:
                 data = self.sys.sample()
                 data["gpu"] = self.gpu.sample()
+                if self.discrete_gpu:
+                    data["discrete_gpu"] = True
                 data["ollama"] = _safe(self.ollama.sample, t0, {"up": False})
                 data["vllm"] = [_safe(v.sample, t0, {"up": False, "url": v.base, "label": v.label, "models": []})
                                 for v in self.vllm]
+                if self.llamacpp:
+                    data["llamacpp"] = _safe(self.llamacpp.sample, t0, self.llamacpp.offline())
             except Exception:  # noqa: BLE001 - a failed sample must never stop the stream
                 traceback.print_exc()
                 time.sleep(self.interval)
@@ -472,13 +587,14 @@ class Sampler:
 
 class Handler(BaseHTTPRequestHandler):
     sampler: Sampler = None
+    title = "Spark Monitor"
 
     def log_message(self, *a):
         pass
 
     def do_GET(self):
         if self.path in ("/", "/index.html"):
-            body = (HERE / "index.html").read_bytes()
+            body = (HERE / "index.html").read_bytes().replace(b"Spark Monitor", escape(self.title).encode())
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
@@ -518,18 +634,35 @@ def main():
     ap.add_argument("--host", default="127.0.0.1", help="bind address (default: localhost only)")
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--interval", type=float, default=1.0, help="seconds between samples")
+    ap.add_argument("--title", default=Handler.title, help="dashboard title")
+    ap.add_argument("--discrete-gpu", action="store_true", help="show GPU VRAM separately from system RAM")
     ap.add_argument("--ollama", default="http://127.0.0.1:11434", help="Ollama base URL; empty string disables")
     ap.add_argument("--vllm", action="append", metavar="URL",
                     help="vLLM base URL, optionally LABEL=URL (label shown instead of 'vLLM'); repeat for "
                          "several servers (default: http://127.0.0.1:8000); empty string disables")
+    ap.add_argument("--llamacpp", metavar="URL", help="llama.cpp base URL (default: disabled)")
+    ap.add_argument("--llamacpp-api-key-file", type=Path, metavar="PATH",
+                    help="file containing the llama.cpp bearer key, if required")
     ap.add_argument("--power-max", type=float, default=140.0,
                     help="watts shown as 100%% on the power dial when NVML reports no limit (GB10 TDP: 140)")
     a = ap.parse_args()
     vllm = a.vllm if a.vllm is not None else ["http://127.0.0.1:8000"]
-    Handler.sampler = Sampler(a.interval, a.ollama, vllm, a.power_max)
+    api_key = None
+    if a.llamacpp_api_key_file:
+        if not a.llamacpp:
+            ap.error("--llamacpp-api-key-file requires --llamacpp")
+        try:
+            api_key = a.llamacpp_api_key_file.read_text().strip()
+        except (OSError, ValueError) as exc:
+            ap.error(f"could not read llama.cpp API key file: {exc}")
+        if not api_key or any(c.isspace() for c in api_key):
+            ap.error("llama.cpp API key file must contain one key")
+    llamacpp = LlamaCpp(a.llamacpp, api_key) if a.llamacpp else None
+    Handler.sampler = Sampler(a.interval, a.ollama, vllm, a.power_max, llamacpp, a.discrete_gpu)
+    Handler.title = a.title
     srv = ThreadingHTTPServer((a.host, a.port), Handler)
     srv.daemon_threads = True
-    print(f"Spark Monitor on http://{a.host}:{a.port}  (GPU via NVML: {Handler.sampler.gpu.ok})")
+    print(f"{a.title} on http://{a.host}:{a.port}  (GPU via NVML: {Handler.sampler.gpu.ok})")
     srv.serve_forever()
 
 

@@ -131,7 +131,7 @@
     </div>
 
     <div class="card">
-      <h2>Unified memory <span class="h2val" id="memhead"></span></h2>
+      <h2><span id="memlabel">Unified memory</span> <span class="h2val" id="memhead"></span></h2>
       <div id="memrows"></div>
     </div>
 
@@ -269,7 +269,8 @@ function render(s) {
   for (const c of s.cpu.per) (groups[c.max_mhz] ||= []).push(c);
   $("clusters").innerHTML = Object.keys(groups).sort((a, b) => b - a).map(mx => {
     const cs = groups[mx], avg = cs.reduce((a, c) => a + c.util, 0) / cs.length;
-    const name = +mx >= 3500 ? "Performance (Cortex-X925)" : "Efficiency (Cortex-A725)";
+    const name = s.discrete_gpu ? (Number(mx) ? `${mx} MHz max` : `${cs.length} logical CPUs`)
+      : +mx >= 3500 ? "Performance (Cortex-X925)" : "Efficiency (Cortex-A725)";
     const mhz = Math.round(cs.reduce((a, c) => a + (c.mhz || 0), 0) / cs.length);
     return `<div class="cluster"><span>${name}</span><span>${avg.toFixed(0)}% · ${mhz} MHz avg</span></div>
       <div class="cores">${cs.map(c => `<div class="core" title="cpu${c.id} · ${c.mhz} MHz">
@@ -277,9 +278,7 @@ function render(s) {
         <span>${c.util.toFixed(0)}</span></div>`).join("")}</div>`;
   }).join("") || `<div class="empty">warming up…</div>`;
 
-  // inference servers (shown in the unified memory card): only reachable ones are listed,
-  // so a machine serving with vLLM alone does not report Ollama as down (and vice versa)
-  const o = s.ollama, vl = s.vllm || [];
+  const o = s.ollama, servers = [...(s.vllm || []), s.llamacpp].filter(Boolean);
   const ctxK = c => c ? `${Math.round(c / 1024)}k ctx` : null;
   const tps = v => v >= 100 ? v.toFixed(0) : v.toFixed(1);
   let inferHtml = "";
@@ -292,11 +291,14 @@ function render(s) {
         <b>${esc(m.name)}</b><span>${fmtB(m.size)} · ${m.size ? Math.round(100 * m.size_vram / m.size) : 0}% GPU${
           m.ctx ? " · " + ctxK(m.ctx) : ""}${m.expires ? " · " + until(m.expires) : ""}</span></div>`).join("");
   }
-  for (const v of vl.filter(v => v?.up)) {
+  for (const v of servers.filter(v => v.up)) {
     const sum = k => v.models.reduce((a, m) => a + (m[k] || 0), 0);
     const queued = sum("waiting");
+    const status = v.models.some(m => m.running != null)
+      ? `${sum("running")} running${queued ? ` · ${queued} queued` : ""}`
+      : v.models.length ? "request counts unavailable" : "no models served";
     inferHtml += `<div class="cluster"><span title="${esc(v.url)}">${esc(v.label || "vLLM")}</span><span>${
-      v.models.length ? `${sum("running")} running${queued ? ` · ${queued} queued` : ""}` : "no models served"}</span></div>` +
+      status}</span></div>` +
       v.models.map(m => `<div class="model" title="${esc(v.url)}">
         <b>${esc(m.name)}</b><span>${[ctxK(m.ctx),
           m.kv_pct != null ? `KV cache ${m.kv_pct.toFixed(0)}%` : null,
@@ -304,25 +306,26 @@ function render(s) {
           m.gen_tps ? `${tps(m.gen_tps)} tok/s out` : null,
           m.prompt_tps ? `${tps(m.prompt_tps)} tok/s in` : null].filter(Boolean).join(" · ")}</span></div>`).join("");
   }
-  if (!inferHtml && (o || vl.length)) {
+  if (!inferHtml && (o || servers.length)) {
     inferHtml = `<div class="cluster"><span>Inference</span><span>${
-      [o && "Ollama", vl.length && "vLLM"].filter(Boolean).join(" / ")} not reachable</span></div>`;
+      [o && "Ollama", s.vllm?.length && "vLLM", s.llamacpp && "llama.cpp"].filter(Boolean).join(" / ")} not reachable</span></div>`;
   }
   if (inferHtml) inferHtml = `<div class="models">${inferHtml}</div>`;
 
-  // memory: stacked bar of where the shared 128 GB goes
-  const gpuMem = Math.min(mem.resident, g ? g.procs.reduce((a, p) => a + (p.gpu_mem || 0), 0) : 0);
+  const gpuMem = g && !s.discrete_gpu
+    ? Math.min(mem.resident, g.procs.reduce((a, p) => a + (p.gpu_mem || 0), 0)) : 0;
   const swapPct = mem.swap_total ? 100 * mem.swap_used / mem.swap_total : 0;
   const segs = [
-    ["GPU processes", gpuMem, "var(--gpu)"],
+    ...(s.discrete_gpu ? [] : [["GPU processes", gpuMem, "var(--gpu)"]]),
     ["apps", mem.resident - gpuMem, "var(--mem)"],
     ["page cache", mem.cache, "color-mix(in srgb, var(--mem) 40%, var(--track))"],
     ["buffers", mem.buffers, "color-mix(in srgb, var(--mem) 20%, var(--track))"],
     ["free", mem.free, "var(--track)"],
   ];
+  $("memlabel").textContent = s.discrete_gpu ? "System RAM" : "Unified memory";
   $("memhead").textContent = `${fmtB(mem.resident)} / ${fmtB(mem.total)} used`;
   $("memrows").innerHTML =
-    `<div class="stack">${segs.slice(0, 4).map(([k, v, c]) =>
+    `<div class="stack">${segs.slice(0, -1).map(([k, v, c]) =>
       `<i style="width:${100 * v / mem.total}%;background:${c}" title="${k} ${fmtB(v)}"></i>`).join("")}</div>
      <div class="mlegend">${segs.map(([k, v, c]) => `<span><b style="background:${c}"></b>${k} ${fmtB(v)}</span>`).join("")}
        <span class="meta">available ${fmtB(mem.avail)} · swap ${fmtB(mem.swap_used)} (${swapPct.toFixed(1)}%)</span></div>` + inferHtml;
@@ -330,6 +333,7 @@ function render(s) {
   // GPU
   push("power", g?.power_w);
   $("gpurows").innerHTML = g ? rows([["Utilization", `${g.util ?? "—"}%`], ["Power draw", `${g.power_w?.toFixed(1) ?? "—"} W`],
+    ...(g.memory ? [["VRAM", `${fmtB(g.memory.used)} / ${fmtB(g.memory.total)}`]] : []),
     ["Temperature", `${g.temp ?? "—"} °C`], ["SM clock", `${g.sm_mhz} MHz (max ${g.sm_max_mhz})`],
     ["Performance state", g.pstate ?? "—"], ["Processes", g.procs.length]]) : `<div class="empty">NVML not available</div>`;
   spark("spark-power", [[hist.power, "var(--warn)"]]);
