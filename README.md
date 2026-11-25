@@ -1,21 +1,24 @@
 # Spark Monitor
 
 A lightweight, live resource dashboard for NVIDIA Linux systems, including
-the **NVIDIA DGX Spark (GB10)** and workstations with discrete NVIDIA GPUs.
+the **NVIDIA DGX Spark and Lenovo ThinkStation PGX (GB10)** and discrete-GPU
+workstations such as the **RTX 5090** and **ThinkStation P520**.
 One Python process collects Linux and NVIDIA metrics and streams them to a
 self-contained browser interface. No pip packages, frontend dependencies,
 external fonts, database, or build step are required.
 
 ## Features
 
-- Eight animated gauges: GPU utilization, GPU clock, GPU power, CPU,
-  unified memory, network utilization, disk busy, and root filesystem usage.
-- Per-core utilization and clocks, grouped by maximum frequency into
-  Cortex-X925 performance and Cortex-A725 efficiency clusters.
-- Shared-memory breakdown for GPU processes, applications, page cache,
-  buffers, free memory, and swap.
-- GPU utilization, temperature, power, SM clock, P-state, and compute/graphics
-  process allocations through NVML, without spawning `nvidia-smi` per sample.
+- GPU utilization, power, and either VRAM usage or GPU clock, plus CPU,
+  RAM, network utilization, disk activity, and root filesystem gauges.
+- Physical core and SMT thread layout, grouped by frequency or cache topology.
+- **Discrete GPUs** display dedicated VRAM under Memory, separately from system
+  RAM, and report PCIe, fan, clock, and encoder/decoder telemetry where available.
+- **GB10 systems** display unified memory with a GPU process allocation breakdown.
+  The monitor detects the memory layout from the NVIDIA device and accepts an
+  override for other hardware.
+- GPU metrics and compute and graphics process allocations come from NVML.
+  Slower GPU and sensor readings are sampled less often.
 - Disk throughput, active physical network interfaces, GPU/SoC/NVMe/ConnectX
   temperatures, load averages, uptime, and the top eight CPU processes.
 - Optional inference-server integration:
@@ -25,17 +28,11 @@ external fonts, database, or build step are required.
     prefill/generation tokens per second. The prefill (“in”) rate excludes
     prefix-cache hits, so it reflects computed tokens.
   - llama.cpp: served model, active and queued requests, and prompt/generation
-    throughput. Workstations can display GPU VRAM separately from system RAM.
-  - Reachable servers are listed. If none respond, one “not reachable” line is shown.
+    throughput where the server exposes these metrics.
 - Light/dark themes with a saved browser preference, responsive cards,
   scrollable process tables, and 120-sample sparklines.
 - On-demand sampling: the sampler waits without clients; hidden tabs close
   their stream. Process scans and inference-server polling run at most once per three seconds.
-
-![Spark Monitor with entirely synthetic demonstration metrics](docs/screenshot.png)
-
-*Illustration uses fabricated metrics, model names, and process information;
-no live machine records or credentials are included.*
 
 ## Stack and architecture
 
@@ -50,9 +47,10 @@ no live machine records or credentials are included.*
 | Background service | systemd user service |
 | Existing HTTPS | External Caddy reverse proxy managed with the local MyApps setup |
 
-`Sampler` owns the hardware and configured inference-server collectors.
+`Collector` owns the hardware and configured inference-server collectors.
 A daemon thread produces a shared JSON snapshot while clients are
 connected; a condition variable distributes updates to SSE request threads.
+Inference endpoints are polled in the background to keep hardware updates responsive.
 The frontend uses `EventSource`, renders the snapshot, and retains only a
 rolling history in the browser. The backend does not persist samples.
 
@@ -60,6 +58,7 @@ Files:
 
 ```text
 server.py                              collectors, sampler, CLI, HTTP/SSE
+inference.py                           vLLM and llama.cpp collectors and polling
 index.html                             complete browser application
 spark-monitor.service                  original deployment unit
 examples/spark-monitor.service.example portable unit with path placeholder
@@ -116,12 +115,13 @@ The examples contain placeholders and local addresses, never credentials.
 | `--port` | `8765` | HTTP port |
 | `--interval` | `1.0` | Seconds between samples; use a positive value |
 | `--title` | `Spark Monitor` | Dashboard and tab title |
-| `--discrete-gpu` | off | Display system RAM and GPU VRAM separately |
+| `--memory-mode` | `auto` | Auto-detect unified GB10 memory or discrete VRAM; override with `unified` or `discrete` |
+| `--discrete-gpu` | off | Compatibility alias for `--memory-mode discrete` |
 | `--ollama` | `http://127.0.0.1:11434` | Ollama base URL; `/api/ps` is appended; `""` disables |
 | `--vllm` | `http://127.0.0.1:8000` | vLLM base URL, optionally `LABEL=URL` (the label replaces "vLLM" in the panel, e.g. `"vLLM · TP2 cluster=http://127.0.0.1:21888"`); repeat for several servers; unreachable ones are hidden; `""` disables |
 | `--llamacpp` | disabled | Base URL of a llama.cpp server running a single model |
 | `--llamacpp-api-key-file` | unset | Path to a file containing the llama.cpp server's bearer key |
-| `--power-max` | `140.0` | Gauge scale in watts if NVML reports no enforced limit |
+| `--power-max` | `140` on unified-memory GPUs | Fallback power limit in watts when NVML omits the limit |
 
 For inference servers on another trusted host or port, replace the placeholders.
 vLLM in Docker is usually published on a host port other than 8000, so pass
@@ -142,7 +142,7 @@ model list is still shown.
 For a workstation serving a model with llama.cpp:
 
 ```bash
-python3 server.py --title "Workstation Monitor" --discrete-gpu --interval 3 \
+python3 server.py --title "Workstation Monitor" --interval 3 \
   --ollama "" --vllm "" --llamacpp http://127.0.0.1:18300
 ```
 
@@ -151,6 +151,13 @@ monitor only reads metadata and metrics. llama.cpp must be started with
 [`--metrics`](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md#get-metrics-prometheus-compatible-metrics-exporter)
 to show queued requests and throughput. When `/metrics` is disabled, the
 monitor reads `/slots` for active requests and context size if available.
+
+For an RTX workstation running Ollama, use the default Ollama URL or pass its
+port explicitly:
+
+```bash
+python3 server.py --title "RTX Monitor" --vllm ""
+```
 
 ## Existing deployment, HTTPS, and schedules
 
@@ -210,20 +217,13 @@ service account (`loginctl enable-linger USERNAME`).
 
 ## Testing and validation
 
-There was no existing automated test suite, lint configuration, package
-manifest, CI workflow, or build pipeline in the original app. Nothing needs to
-be bundled. Basic local checks:
+Hardware detection and model-server fixtures can run without an NVIDIA driver
+or an inference server:
 
 ```bash
-python3 - <<'PY'
-import ast
-from pathlib import Path
-source = Path('server.py').read_text()
-ast.parse(source)
-compile(source, 'server.py', 'exec')
-print('Python syntax OK')
-PY
+python3 -m unittest discover -s tests
 python3 server.py --help
+python3 server.py --once --ollama "" --vllm ""
 ```
 
 For a fresh test instance, use localhost and an unused port, then check from a
@@ -252,7 +252,7 @@ external services; they are separate from Python syntax and isolated HTTP checks
 | --- | --- |
 | Address already in use | Check `ss -ltn`; choose an unused `--port` instead of stopping the existing service |
 | GPU shows n/a | Check driver health and `ldconfig -p` for `libnvidia-ml.so.1`; a missing library allows system monitoring to continue |
-| NVML error or stopped updates | Confirm the installed driver exposes the NVML functions used in `GPU`; not every ABI failure is handled |
+| Unexpected memory layout | Use `--memory-mode unified` or `--memory-mode discrete` if the driver reports an unfamiliar GPU name |
 | CPU/rate fields initially blank | Wait for successive samples; utilization is calculated from counter deltas |
 | No Ollama models | Ensure Ollama is reachable at the configured URL; `/api/ps` lists loaded models, not all installed models |
 | vLLM missing or “not reachable” | `curl http://HOST:PORT/v1/models` against the `--vllm` URL; for Docker, use the published host port |
