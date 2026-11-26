@@ -14,6 +14,7 @@ import os
 import re
 import socket
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -714,6 +715,8 @@ class TempCollector:
         self.thermal_zones = [sensor for path in Path("/sys/class/thermal").glob("thermal_zone*/temp")
                               if (sensor := try_sysfile(path)) is not None]
         counts = {}
+        seen = set()                # (physical device, chip, label) already listed
+        serials = self._device_serials()
         base = "/sys/class/hwmon"
         for hw in sorted(os.listdir(base), key=lambda s: int(re.sub(r"\D", "", s) or 0)):
             d = f"{base}/{hw}"
@@ -733,6 +736,13 @@ class TempCollector:
                     if x and x.lstrip("-").isdigit() and 30000 < int(x) < 150000:
                         crit = int(x) / 1000
                         break
+                # One chip can expose the same sensor through several PCI functions or PCIe links
+                # (a GB10's ConnectX-7 shows up four times); list each physical device once.
+                pci = os.path.basename(os.path.realpath(d + "/device"))
+                phys = serials.get(pci) or re.sub(r"\.\d+$", "", pci)
+                if (phys, chip, label) in seen:
+                    continue
+                seen.add((phys, chip, label))
                 group, name = self._describe(chip, label, d, counts)
                 # DIMM (SMBus) and NVMe sensors block for 1-3 ms per read: slow tier
                 t = time.perf_counter()
@@ -741,6 +751,22 @@ class TempCollector:
                 slow = (time.perf_counter() - t) / 3 * 1000 > SLOW_CALL_MS
                 self.sensors.append({"file": f, "chip": chip, "label": name, "group": group,
                                      "crit": crit, "slow": slow, "last": v / 1000})
+
+    @staticmethod
+    def _device_serials():
+        """{PCI address: serial number} from devlink, so PCI functions of one physical chip can be
+        merged. Empty when devlink is missing; then functions of one PCI device are merged."""
+        try:
+            out = subprocess.run(["devlink", "-j", "dev", "info"], capture_output=True, text=True, timeout=5).stdout
+            info = json.loads(out or "{}").get("info", {})
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return {}
+        res = {}
+        for dev, v in info.items():
+            serial = v.get("serial_number") or v.get("board.serial_number")
+            if dev.startswith("pci/") and serial:
+                res[dev[4:]] = serial
+        return res
 
     @staticmethod
     def _describe(chip, label, d, counts):

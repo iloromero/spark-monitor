@@ -98,3 +98,17 @@ class DiscoveryTests(unittest.TestCase):
         asked.clear()
         found = d.scan(2 * d.SCAN_S + 2, {"vllm": [], "llamacpp": []})
         self.assertNotIn(11434, asked)            # not a vLLM/llama.cpp server: asked again only after RECHECK_S
+
+
+class TempTests(unittest.TestCase):
+    def test_devlink_serials_map_pci_functions_to_one_chip(self):
+        from types import SimpleNamespace
+        from server import TempCollector
+        out = json.dumps({"info": {f"pci/{a}": {"serial_number": "SER1"} for a in
+                                   ("0000:01:00.0", "0000:01:00.1", "0002:01:00.0", "0002:01:00.1")}})
+        with patch("server.subprocess.run", return_value=SimpleNamespace(stdout=out)):
+            serials = TempCollector._device_serials()
+        self.assertEqual(set(serials.values()), {"SER1"})
+        self.assertEqual(len(serials), 4)
+        with patch("server.subprocess.run", side_effect=FileNotFoundError()):
+            self.assertEqual(TempCollector._device_serials(), {})
