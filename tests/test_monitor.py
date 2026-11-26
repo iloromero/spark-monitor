@@ -51,7 +51,7 @@ class InferenceTests(unittest.TestCase):
             self.assertEqual(request.call_count, 3)   # /v1/models, /slots, /metrics (501: skipped for 60 s)
             self.assertEqual(llama.sample(4), sample)
             self.assertEqual(request.call_count, 5)   # /v1/models, /slots
-        self.assertEqual(sample["models"], [{"name": "test-model", "running": 1, "ctx": 131072}])
+        self.assertEqual(sample["models"], [{"name": "test-model", "running": 1, "ctx": 131072, "kv_pct": 0.0}])
         self.assertNotIn("private fixture", json.dumps(sample))
 
 
@@ -112,3 +112,27 @@ class TempTests(unittest.TestCase):
         self.assertEqual(len(serials), 4)
         with patch("server.subprocess.run", side_effect=FileNotFoundError()):
             self.assertEqual(TempCollector._device_serials(), {})
+
+
+class LlamaKvTests(unittest.TestCase):
+    def test_kv_use_prefix_hits_and_rates(self):
+        state = {"pt": 1000, "ct": 9000, "gt": 500}
+
+        def get(url, *, headers):
+            if url.endswith("/v1/models"):
+                return b'{"data":[{"id":"m"}]}'
+            if url.endswith("/slots"):
+                return json.dumps([{"is_processing": True, "n_ctx": 1000, "n_prompt_tokens": 400,
+                                    "n_prompt_tokens_cache": 300, "next_token": [{"n_decoded": 100}]}]).encode()
+            return (f"llamacpp:prompt_tokens_total {state['pt']}\nllamacpp:prompt_tokens_cached_total {state['ct']}\n"
+                    f"llamacpp:tokens_predicted_total {state['gt']}\nllamacpp:requests_processing 1\n").encode()
+
+        with patch("inference._get", side_effect=get):
+            llama = LlamaCpp("http://localhost:1", None)
+            first = llama.sample(10)["models"][0]
+            state.update(pt=1400, gt=700)
+            second = llama.sample(20)["models"][0]
+        self.assertEqual(first["kv_pct"], 50.0)                 # (400 prompt + 100 generated) / 1000
+        self.assertEqual(first["cache_hit_pct"], 90.0)          # 9000 cached / 10000 prompt tokens
+        self.assertNotIn("gen_tps", first)                      # no baseline yet
+        self.assertEqual((second["prompt_tps"], second["gen_tps"]), (40.0, 20.0))

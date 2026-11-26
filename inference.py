@@ -166,11 +166,12 @@ class InferencePoller(threading.Thread):
             return endpoint.offline()
 
 
-LLAMACPP_METRICS = {
+LLAMACPP_METRICS = {  # /metrics (llama-server --metrics)
     "llamacpp:requests_processing": "running",
     "llamacpp:requests_deferred": "waiting",
-    "llamacpp:prompt_tokens_seconds": "prompt_tps",
-    "llamacpp:predicted_tokens_seconds": "gen_tps",
+    "llamacpp:prompt_tokens_total": "prompt_tokens",          # prompt tokens computed (cache misses)
+    "llamacpp:prompt_tokens_cached_total": "cached_tokens",   # prompt tokens served from the prefix cache
+    "llamacpp:tokens_predicted_total": "gen_tokens",
 }
 
 
@@ -184,6 +185,7 @@ class LlamaCpp:
         self.last = self.offline()
         self.t = float("-inf")
         self.retry_metrics_at = float("-inf")
+        self.prev = None  # (t, prompt_tokens, gen_tokens) for rates
 
     def offline(self):
         return {"up": False, "url": self.base, "label": self.label, "models": []}
@@ -216,16 +218,29 @@ class LlamaCpp:
     def _slots(self):
         try:
             slots = json.loads(_get(self.base + "/slots", headers=self.headers))
-        except (OSError, ValueError):
+        except (OSError, ValueError, http.client.HTTPException):
             return {}
         if not isinstance(slots, list) or not slots or not all(isinstance(s, dict) for s in slots):
             return {}
+        num = lambda v: v if isinstance(v, (int, float)) and not isinstance(v, bool) else 0
         stats = {}
         if all(isinstance(s.get("is_processing"), bool) for s in slots):
             stats["running"] = sum(s["is_processing"] for s in slots)
         contexts = {s["n_ctx"] for s in slots if isinstance(s.get("n_ctx"), int) and s["n_ctx"] > 0}
         if len(contexts) == 1:
             stats["ctx"] = contexts.pop()
+        total = sum(num(s.get("n_ctx")) for s in slots)
+        if total:  # KV cache held by active requests (prompt + generated so far), as vLLM reports it
+            used = 0
+            for s in slots:
+                if s.get("is_processing"):
+                    nt = s.get("next_token")
+                    nt = nt[0] if isinstance(nt, list) and nt and isinstance(nt[0], dict) else nt
+                    used += num(s.get("n_prompt_tokens")) + num(nt.get("n_decoded") if isinstance(nt, dict) else 0)
+            stats["kv_pct"] = min(100.0, 100 * used / total)
+        prompt = sum(num(s.get("n_prompt_tokens")) for s in slots)
+        if prompt:  # fallback hit rate (current/last request) when /metrics is off
+            stats["cache_hit_pct"] = 100 * sum(num(s.get("n_prompt_tokens_cache")) for s in slots) / prompt
         return stats
 
     def sample(self, now):
@@ -249,8 +264,21 @@ class LlamaCpp:
             self.last = self.offline()
             return self.last
         metrics = {}
-        if len(models) == 1:  # /slots gives the context size; /metrics (if enabled) the token rates
-            metrics = {**self._slots(), **self._metrics(now)}
+        if len(models) == 1:  # /slots: context size and KV use; /metrics (if enabled): counters for rates
+            metrics = self._slots()
+            m = self._metrics(now)
+            for k in ("running", "waiting"):
+                if k in m:
+                    metrics[k] = m[k]
+            pt, ct, gt = m.get("prompt_tokens"), m.get("cached_tokens"), m.get("gen_tokens")
+            if pt is not None and ct is not None and pt + ct > 0:  # since server start, like vLLM's
+                metrics["cache_hit_pct"] = 100 * ct / (pt + ct)
+            if pt is not None and gt is not None:
+                if self.prev and now > self.prev[0] and pt >= self.prev[1] and gt >= self.prev[2]:
+                    dt = now - self.prev[0]
+                    metrics["prompt_tps"] = (pt - self.prev[1]) / dt
+                    metrics["gen_tps"] = (gt - self.prev[2]) / dt
+                self.prev = (now, pt, gt)
         self.last = {
             "up": True, "url": self.base, "label": self.label,
             "models": [{"name": model.get("id"), **metrics} for model in models],
