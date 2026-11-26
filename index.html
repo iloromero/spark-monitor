@@ -533,8 +533,10 @@ function updateVram(s) {
 
 function updateOllama(s) {
   const o = s.ollama;
-  const otherUp = s.llamacpp?.up || s.vllm.some(v => v.up);
-  $("ollama-section").hidden = !o || (!o.ok && otherUp);
+  // Show only the server(s) with a model loaded; Ollama's "No models loaded" only when nothing is loaded anywhere.
+  const otherUp = [...s.vllm, ...(s.llamacpp_all || [s.llamacpp])].some(v => v?.up);
+  const otherLoaded = [...s.vllm, ...(s.llamacpp_all || [s.llamacpp])].some(v => v?.up && v.models.length);
+  $("ollama-section").hidden = !o || (!o.ok && otherUp) || (o.ok && !o.models.length && otherLoaded);
   if ($("ollama-section").hidden) return;
   const models = o.models;
   const box = $("ollama");
@@ -558,8 +560,11 @@ function updateOllama(s) {
 }
 
 function updateInference(s) {
-  const sources = [...s.vllm, s.llamacpp].filter(Boolean);
-  const live = sources.filter(v => v.up);
+  const sources = [...s.vllm, ...(s.llamacpp_all || [s.llamacpp])].filter(Boolean);
+  const ollamaLoaded = !!(s.ollama?.ok && s.ollama.models.length);
+  const loaded = sources.filter(v => v.up && v.models.length);
+  // a running server with no model is listed only when nothing else is loaded
+  const live = loaded.length || ollamaLoaded ? loaded : sources.filter(v => v.up);
   if (!live.length) {
     $("inference").innerHTML = sources.length && !s.ollama?.ok
       ? `<div class="divider"></div><div class="subhead"><span>Inference</span><span class="r">${esc(sources.map(v => v.label).join(" / "))} unavailable</span></div>` : "";

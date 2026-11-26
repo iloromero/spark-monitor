@@ -48,8 +48,53 @@ class InferenceTests(unittest.TestCase):
             llama = LlamaCpp("http://localhost:18300/v1", "test-key")
             sample = llama.sample(1)
             self.assertEqual(llama.sample(2), sample)
-            self.assertEqual(request.call_count, 3)
+            self.assertEqual(request.call_count, 3)   # /v1/models, /slots, /metrics (501: skipped for 60 s)
             self.assertEqual(llama.sample(4), sample)
-            self.assertEqual(request.call_count, 5)
+            self.assertEqual(request.call_count, 5)   # /v1/models, /slots
         self.assertEqual(sample["models"], [{"name": "test-model", "running": 1, "ctx": 131072}])
         self.assertNotIn("private fixture", json.dumps(sample))
+
+
+class DiscoveryTests(unittest.TestCase):
+    def test_classify_tells_servers_apart_by_owner(self):
+        from inference import classify
+        bodies = {"vllm": b'{"data":[{"id":"m","owned_by":"vllm"}]}',
+                  "llamacpp": b'{"data":[{"id":"m","owned_by":"llamacpp"}]}',
+                  "ollama": b'{"object":"list","data":[{"id":"m","owned_by":"library"}]}'}
+        for kind, body in bodies.items():
+            with self.subTest(kind=kind), patch("inference._get", return_value=body):
+                self.assertEqual(classify("http://127.0.0.1:1"), kind)
+        with patch("inference._get", side_effect=ConnectionRefusedError()):
+            self.assertIsNone(classify("http://127.0.0.1:1"))
+
+    def test_key_protected_llama_server_is_recognised(self):
+        from inference import classify
+
+        def get(url, **kw):
+            if url.endswith("/v1/models"):
+                raise HTTPError(url, 401, "unauthorized", {}, None)
+            return b'{"status":"ok"}'
+        with patch("inference._get", side_effect=get):
+            self.assertEqual(classify("http://127.0.0.1:1"), "llamacpp")
+
+    def test_scan_follows_servers_that_start_and_stop(self):
+        from inference import Discovery, skip_port
+        ports = {11434: "127.0.0.1", 18400: "127.0.0.1", 8000: "127.0.0.1", 29521: "127.0.0.1", 40001: "10.0.0.1"}
+        kinds = {11434: "ollama", 18400: "llamacpp", 8000: "vllm"}
+        asked = []
+
+        def classify(base, api_key=None):
+            port = int(base.rsplit(":", 1)[1]); asked.append(port); return kinds.get(port)
+        d = Discovery(8888, ports=lambda: dict(ports), classify=classify)
+        found = d.scan(0, {"vllm": [], "llamacpp": []})
+        self.assertEqual([e.base for e in found["llamacpp"]], ["http://127.0.0.1:18400"])
+        self.assertEqual([e.label for e in found["vllm"]], ["vLLM"])
+        self.assertNotIn(29521, asked)            # torch rendezvous port: never probed
+        self.assertNotIn(40001, asked)            # ephemeral worker port: never probed
+        self.assertTrue(skip_port(29521) and skip_port(40001) and not skip_port(18400))
+        del ports[18400]                          # the llama.cpp server stopped
+        found = d.scan(d.SCAN_S + 1, {"vllm": [], "llamacpp": []})
+        self.assertEqual(found["llamacpp"], [])
+        asked.clear()
+        found = d.scan(2 * d.SCAN_S + 2, {"vllm": [], "llamacpp": []})
+        self.assertNotIn(11434, asked)            # not a vLLM/llama.cpp server: asked again only after RECHECK_S

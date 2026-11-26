@@ -26,7 +26,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from inference import InferencePoller, LlamaCpp, VLLM
+from inference import Discovery, InferencePoller, LlamaCpp, VLLM
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CLK_TCK = os.sysconf("SC_CLK_TCK")
@@ -949,7 +949,7 @@ class OllamaPoller(threading.Thread):
 # ------------------------------------------------------------------ collector
 
 class Collector:
-    def __init__(self, ollama_url, interval, *, title, memory_mode, power_max, endpoints):
+    def __init__(self, ollama_url, interval, *, title, memory_mode, power_max, endpoints, discovery=None):
         self.interval = interval
         self.topo = cpu_topology()
         self.nv, self.gpus, nvinfo, self.nvml_error = open_nvml(memory_mode, power_max)
@@ -963,7 +963,8 @@ class Collector:
         self.ollama = OllamaPoller(ollama_url) if ollama_url else None
         if self.ollama:
             self.ollama.start()
-        self.inference = InferencePoller(endpoints) if any(endpoints.values()) else None
+        self.inference = (InferencePoller(endpoints, discovery)
+                          if discovery or any(endpoints.values()) else None)
         if self.inference:
             self.inference.start()
         self.loadavg = SysFile("/proc/loadavg")
@@ -1032,8 +1033,9 @@ class Collector:
         inference = self.inference.results if self.inference else {}
         s["vllm"] = inference.get("vllm", [])
         llamacpp = inference.get("llamacpp", [])
-        if llamacpp:
-            s["llamacpp"] = llamacpp[0]
+        if llamacpp:  # first (prefer a live one) under the old key; every server under llamacpp_all
+            s["llamacpp"] = next((r for r in llamacpp if r.get("up")), llamacpp[0])
+            s["llamacpp_all"] = llamacpp
         s["d"] = self.dials(s)
         s["cost_ms"] = round((time.perf_counter() - t0) * 1000, 2)
         s["cpu_ms"] = round((time.thread_time() - c0) * 1000, 2)
@@ -1207,15 +1209,17 @@ def main():
     ap.add_argument("--power-max", type=float, help="fallback GPU power limit in watts when NVML omits it")
     ap.add_argument("--ollama", default="http://127.0.0.1:11434", help="Ollama base URL; empty string disables")
     ap.add_argument("--vllm", action="append", metavar="URL",
-                    help="vLLM base URL or LABEL=URL; repeat for multiple servers; empty string disables")
-    ap.add_argument("--llamacpp", metavar="URL", help="llama.cpp base URL (default: disabled)")
+                    help="extra vLLM base URL or LABEL=URL (e.g. a remote TP cluster); repeatable")
+    ap.add_argument("--llamacpp", metavar="URL", help="extra llama.cpp base URL")
+    ap.add_argument("--no-discover", dest="discover", action="store_false",
+                    help="do not look for vLLM/llama.cpp servers on this machine's listening ports")
     ap.add_argument("--llamacpp-api-key-file", type=Path, metavar="PATH",
                     help="file containing the llama.cpp bearer key, if required")
     ap.add_argument("--once", action="store_true", help="print one sample as JSON and exit")
     a = ap.parse_args()
     a.interval = max(0.25, a.interval)
 
-    vllm = a.vllm if a.vllm is not None else ["http://127.0.0.1:8000"]
+    vllm = a.vllm or []
     api_key = None
     if a.llamacpp_api_key_file:
         if not a.llamacpp:
@@ -1228,8 +1232,9 @@ def main():
             ap.error("llama.cpp API key file must contain one key")
     endpoints = {"vllm": [VLLM(url) for url in vllm if url],
                  "llamacpp": [LlamaCpp(a.llamacpp, api_key)] if a.llamacpp else []}
+    discovery = Discovery(a.port, api_key) if a.discover else None
     c = Collector(a.ollama, a.interval, title=a.title, memory_mode=a.memory_mode,
-                  power_max=a.power_max, endpoints=endpoints)
+                  power_max=a.power_max, endpoints=endpoints, discovery=discovery)
     if a.once:
         c.sample()                            # primes the deltas and kicks the Ollama poll
         time.sleep(a.interval)

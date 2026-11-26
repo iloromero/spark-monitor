@@ -71,8 +71,8 @@ examples/Caddyfile.example             optional HTTPS example
 - NVIDIA driver and its NVML shared library for GPU data. No NVIDIA Python
   package or CUDA toolkit is required by this app.
 - A modern browser supporting SSE, SVG, CSS Grid, and `color-mix()`.
-- Optional Ollama server (default `http://127.0.0.1:11434`), vLLM
-  (default `http://127.0.0.1:8000`), or llama.cpp server (disabled by default).
+- Optional Ollama server (default `http://127.0.0.1:11434`); vLLM and llama.cpp
+  servers on the same machine are found automatically (see "Which model server is shown").
 - Optional systemd and Caddy for service management and HTTPS.
 
 The optional llama.cpp integration can read a bearer key from a local file.
@@ -118,18 +118,17 @@ The examples contain placeholders and local addresses, never credentials.
 | `--memory-mode` | `auto` | Auto-detect unified GB10 memory or discrete VRAM; override with `unified` or `discrete` |
 | `--discrete-gpu` | off | Compatibility alias for `--memory-mode discrete` |
 | `--ollama` | `http://127.0.0.1:11434` | Ollama base URL; `/api/ps` is appended; `""` disables |
-| `--vllm` | `http://127.0.0.1:8000` | vLLM base URL, optionally `LABEL=URL` (the label replaces "vLLM" in the panel, e.g. `"vLLM · TP2 cluster=http://127.0.0.1:21888"`); repeat for several servers; unreachable ones are hidden; `""` disables |
-| `--llamacpp` | disabled | Base URL of a llama.cpp server running a single model |
+| `--vllm` | none (discovered) | Extra vLLM base URL, optionally `LABEL=URL` (the label replaces "vLLM" in the panel, e.g. `"vLLM · TP2 cluster=http://127.0.0.1:21888"`); repeat for several servers; shown even when down |
+| `--llamacpp` | none (discovered) | Extra llama.cpp server URL (single model) |
+| `--no-discover` | discovery on | Do not look for vLLM/llama.cpp servers on this machine's listening ports |
 | `--llamacpp-api-key-file` | unset | Path to a file containing the llama.cpp server's bearer key |
 | `--power-max` | `140` on unified-memory GPUs | Fallback power limit in watts when NVML omits the limit |
 
-For inference servers on another trusted host or port, replace the placeholders.
-vLLM in Docker is usually published on a host port other than 8000, so pass
-that port:
+Servers on this machine, including vLLM in Docker on any published port, are
+discovered. For servers on another trusted host, pass them explicitly:
 
 ```bash
-python3 server.py --ollama http://OLLAMA_HOSTNAME:11434 \
-  --vllm http://127.0.0.1:VLLM_HOST_PORT --vllm http://VLLM_HOSTNAME:8000
+python3 server.py --ollama http://OLLAMA_HOSTNAME:11434 --vllm http://VLLM_HOSTNAME:8000
 ```
 
 Each request has a 0.5-second timeout and runs at most every three seconds.
@@ -139,11 +138,12 @@ continues either way. Token rates come from differences between vLLM counters,
 so they appear from the second poll onward. If `/metrics` is unavailable, the
 model list is still shown.
 
-For a workstation serving a model with llama.cpp:
+For a workstation serving a model with llama.cpp, discovery finds it; name it
+only to keep it listed while it is down:
 
 ```bash
-python3 server.py --title "Workstation Monitor" --interval 3 \
-  --ollama "" --vllm "" --llamacpp http://127.0.0.1:18300
+python3 server.py --title "Workstation Monitor" --interval 3 --ollama "" \
+  --llamacpp http://127.0.0.1:18300
 ```
 
 Add `--llamacpp-api-key-file /path/to/key` for a protected endpoint. The
@@ -152,12 +152,32 @@ monitor only reads metadata and metrics. llama.cpp must be started with
 to show queued requests and throughput. When `/metrics` is disabled, the
 monitor reads `/slots` for active requests and context size if available.
 
-For an RTX workstation running Ollama, use the default Ollama URL or pass its
-port explicitly:
+### Which model server is shown
+
+The monitor finds the model servers running on the machine by itself, so the
+same command works on a DGX Spark and on an RTX workstation, and the view
+follows whichever server is up as that changes:
+
+- **Ollama** is polled at `--ollama` (default `http://127.0.0.1:11434`).
+- **vLLM and llama.cpp** are discovered every 30 s on the machine's listening
+  ports: each port is asked once for `/v1/models`, and the answer's `owned_by`
+  tells vLLM, llama.cpp and Ollama apart. A key-protected llama-server is
+  recognised by its public `/health` (pass `--llamacpp-api-key-file` for its
+  details). A port that is not a model server is asked again only after
+  10 minutes. Servers that stop are dropped from the view.
+- Never probed: well-known non-HTTP ports, the PyTorch rendezvous range
+  29400-29999 and ephemeral ports (32768+), where multi-node workers listen.
+- `--vllm LABEL=URL` and `--llamacpp URL` add servers discovery cannot see, for
+  example a TP cluster endpoint on another node; `--no-discover` turns discovery off.
+
+llama-server reports tokens/s only when it is started with `--metrics`.
 
 ```bash
-python3 server.py --title "RTX Monitor" --vllm ""
+python3 server.py --title "RTX Monitor"
 ```
+
+`examples/rtx-monitor.override.conf.example` is the systemd drop-in used on the
+RTX 5090 workstation.
 
 ## Existing deployment, HTTPS, and schedules
 

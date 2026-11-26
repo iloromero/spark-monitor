@@ -1,0 +1,7 @@
+# ~/.config/systemd/user/rtx-monitor.service.d/10-shared-monitor.conf
+# Runs this monitor as the RTX workstation's dashboard. Ollama is polled at its default URL; vLLM and
+# llama.cpp servers are discovered on the listening ports (servers that are not running are hidden).
+[Service]
+WorkingDirectory=%h/projects/spark-monitor
+ExecStart=
+ExecStart=/usr/bin/python3 %h/projects/spark-monitor/server.py --host 0.0.0.0 --port 8888 --title "RTX Monitor"

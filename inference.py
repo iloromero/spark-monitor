@@ -1,7 +1,10 @@
-"""Read-only model metadata and serving metrics for vLLM and llama.cpp."""
+"""Read-only model metadata and serving metrics for vLLM and llama.cpp, plus discovery of the
+servers running on this machine (found on its listening ports, so the view follows whichever is up)."""
 
+import http.client
 import json
 import math
+import socket
 import threading
 import time
 import traceback
@@ -63,7 +66,7 @@ class VLLM:
             label = "vLLM"
         self.label = label
         self.base = url.rstrip("/")
-        self.t = 0
+        self.t = float("-inf")
         self.last = self.offline()
         self.prev = None  # (t, {model: (prompt_tokens, gen_tokens)}) for rates
 
@@ -117,22 +120,42 @@ class VLLM:
 
 
 class InferencePoller(threading.Thread):
-    """Refresh configured serving endpoints away from the hardware sampling thread."""
+    """Refresh serving endpoints away from the hardware sampling thread. With a Discovery, servers that
+    start or stop on this machine are added or dropped automatically; configured ones are always kept."""
 
-    def __init__(self, endpoints):
+    def __init__(self, endpoints, discovery=None):
         super().__init__(daemon=True, name="inference")
-        self.endpoints = endpoints
+        self.configured = {name: list(endpoints.get(name, [])) for name in ("vllm", "llamacpp")}
+        self.endpoints = {name: list(group) for name, group in self.configured.items()}
+        self.discovery = discovery
         self.results = {name: [endpoint.offline() for endpoint in group]
-                        for name, group in endpoints.items()}
+                        for name, group in self.endpoints.items()}
         self.kick = threading.Event()
 
     def run(self):
         while True:
             self.kick.wait()
             self.kick.clear()
-            now = time.monotonic()
-            self.results = {name: [self._sample(endpoint, now) for endpoint in group]
-                            for name, group in self.endpoints.items()}
+            self.refresh(time.monotonic())
+
+    def refresh(self, now):
+        if self.discovery:
+            try:
+                found = self.discovery.scan(now, self.configured)
+                self.endpoints = {name: self.configured[name] + found.get(name, [])
+                                  for name in self.configured}
+            except Exception:
+                traceback.print_exc()
+        results = {}
+        for name, group in self.endpoints.items():
+            rows = []
+            for endpoint in group:
+                r = self._sample(endpoint, now)
+                # a discovered server that stopped answering is dropped; a configured one is shown as down
+                if r.get("up") or endpoint in self.configured[name]:
+                    rows.append(r)
+            results[name] = rows
+        self.results = results
 
     @staticmethod
     def _sample(endpoint, now):
@@ -154,7 +177,8 @@ LLAMACPP_METRICS = {
 class LlamaCpp:
     """Read model metadata and optional metrics from a single-model llama-server."""
 
-    def __init__(self, url, api_key):
+    def __init__(self, url, api_key, label="llama.cpp"):
+        self.label = label
         self.base = url.rstrip("/").removesuffix("/v1")
         self.headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
         self.last = self.offline()
@@ -162,7 +186,7 @@ class LlamaCpp:
         self.retry_metrics_at = float("-inf")
 
     def offline(self):
-        return {"up": False, "url": self.base, "label": "llama.cpp", "models": []}
+        return {"up": False, "url": self.base, "label": self.label, "models": []}
 
     def _metrics(self, now):
         if now < self.retry_metrics_at:
@@ -210,16 +234,161 @@ class LlamaCpp:
         self.t = now
         try:
             models = json.loads(_get(self.base + "/v1/models", headers=self.headers)).get("data", [])
-        except (OSError, ValueError):
+        except HTTPError as exc:
+            exc.close()
+            up = False
+            if exc.code in (401, 403):  # running, but needs a key (--llamacpp-api-key-file)
+                try:
+                    up = json.loads(_get(self.base + "/health")).get("status") == "ok"
+                except (OSError, ValueError, AttributeError, http.client.HTTPException):
+                    pass
+            self.last = ({"up": True, "url": self.base, "label": self.label,
+                          "models": [{"name": "API key needed to show details"}]} if up else self.offline())
+            return self.last
+        except (OSError, ValueError, http.client.HTTPException):
             self.last = self.offline()
             return self.last
         metrics = {}
-        if len(models) == 1:
-            metrics = self._metrics(now)
-            if not metrics:
-                metrics = self._slots()
+        if len(models) == 1:  # /slots gives the context size; /metrics (if enabled) the token rates
+            metrics = {**self._slots(), **self._metrics(now)}
         self.last = {
-            "up": True, "url": self.base, "label": "llama.cpp",
+            "up": True, "url": self.base, "label": self.label,
             "models": [{"name": model.get("id"), **metrics} for model in models],
         }
         return self.last
+
+
+# --- discovery ----------------------------------------------------------------------------------
+SKIP_PORTS = {22, 25, 53, 80, 111, 139, 443, 445, 631, 3389, 5432, 6379}
+
+
+def skip_port(port):
+    """Ports never probed: well-known non-HTTP services, the PyTorch distributed rendezvous range
+    (29400-29999, e.g. a TP cluster's master port) and the ephemeral range, where multi-node workers
+    listen for NCCL/Gloo/Ray traffic. Inference servers use fixed lower ports."""
+    return port in SKIP_PORTS or 29400 <= port <= 29999 or port >= 32768
+
+
+def listening_ports():
+    """{port: host to probe} for TCP sockets in LISTEN state (/proc/net/tcp and tcp6). Wildcard binds
+    are probed on loopback, specific binds on their own address."""
+    out = {}
+    for path, v6 in (("/proc/net/tcp", False), ("/proc/net/tcp6", True)):
+        try:
+            with open(path) as fh:
+                lines = fh.read().splitlines()[1:]
+        except OSError:
+            continue
+        for line in lines:
+            f = line.split()
+            if len(f) < 4 or f[3] != "0A":
+                continue
+            addr, port_hex = f[1].rsplit(":", 1)
+            port = int(port_hex, 16)
+            raw = bytes.fromhex(addr)
+            if v6:
+                ip = socket.inet_ntop(socket.AF_INET6, b"".join(raw[i:i + 4][::-1] for i in range(0, 16, 4)))
+                if ip.startswith("::ffff:"):
+                    ip = ip[7:]
+            else:
+                ip = socket.inet_ntop(socket.AF_INET, raw[::-1])
+            if ip in ("0.0.0.0", "::"):
+                host = "127.0.0.1"
+            elif ip.startswith("127.0.0.5"):          # systemd-resolved stub listeners
+                continue
+            else:
+                host = f"[{ip}]" if ":" in ip else ip
+            if port not in out or host == "127.0.0.1":
+                out[port] = host
+    return out
+
+
+def classify(base, api_key=None):
+    """'vllm', 'llamacpp', 'ollama' or None for the HTTP server at base. One /v1/models request tells
+    the three apart (owned_by); a key-protected llama-server is recognised by its public /health."""
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    try:
+        body = json.loads(_get(base + "/v1/models", timeout=0.4, headers=headers))
+    except HTTPError as exc:
+        exc.close()
+        if exc.code in (401, 403):
+            try:
+                if json.loads(_get(base + "/health", timeout=0.4)).get("status") == "ok":
+                    return "llamacpp"
+            except (OSError, ValueError, AttributeError):
+                pass
+        return None
+    except (OSError, ValueError, http.client.HTTPException):
+        return None
+    except Exception:  # a non-HTTP service: never let one odd port stop the scan
+        return None
+    data = body.get("data") if isinstance(body, dict) else None
+    if not isinstance(data, list):
+        return None
+    owners = {str(m.get("owned_by", "")).lower() for m in data if isinstance(m, dict)}
+    if "vllm" in owners:
+        return "vllm"
+    if "llamacpp" in owners:
+        return "llamacpp"
+    if owners & {"library", "ollama"}:
+        return "ollama"
+    try:  # no models listed: llama-server still answers /props
+        props = json.loads(_get(base + "/props", timeout=0.4, headers=headers))
+        if isinstance(props, dict) and "default_generation_settings" in props:
+            return "llamacpp"
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+class Discovery:
+    """Finds vLLM and llama.cpp servers on this machine's listening ports, every SCAN_S seconds. A port
+    that answers as neither is asked again only after RECHECK_S, so ordinary web apps see one request
+    every few minutes. Ollama stays with --ollama (its own poller)."""
+
+    SCAN_S = 30
+    RECHECK_S = 600
+
+    def __init__(self, own_port, api_key=None, ports=listening_ports, classify=classify):
+        self.skip = SKIP_PORTS | {own_port}
+        self.api_key = api_key
+        self.ports, self.classify = ports, classify
+        self.t = float("-inf")
+        self.known = {}       # port -> (kind, endpoint)
+        self.negative = {}    # port -> time to ask again
+        self.found = {"vllm": [], "llamacpp": []}
+
+    @staticmethod
+    def _port(endpoint):
+        try:
+            return int(endpoint.base.rsplit(":", 1)[1].split("/")[0])
+        except (ValueError, IndexError):
+            return None
+
+    def scan(self, now, configured):
+        if now - self.t < self.SCAN_S:
+            return self.found
+        self.t = now
+        taken = {self._port(e) for group in configured.values() for e in group}
+        listening = self.ports()
+        for port in list(self.known):
+            if port not in listening:
+                del self.known[port]
+        for port, host in sorted(listening.items()):
+            if port in self.skip or skip_port(port) or port in taken or port in self.known or self.negative.get(port, 0) > now:
+                continue
+            base = f"http://{host}:{port}"
+            kind = self.classify(base, self.api_key)
+            if kind == "vllm":
+                self.known[port] = (kind, VLLM(f"vLLM={base}"))
+            elif kind == "llamacpp":
+                self.known[port] = (kind, LlamaCpp(base, self.api_key))
+            else:
+                self.negative[port] = now + self.RECHECK_S
+        self.found = {"vllm": [e for k, e in self.known.values() if k == "vllm"],
+                      "llamacpp": [e for k, e in self.known.values() if k == "llamacpp"]}
+        for kind, name in (("vllm", "vLLM"), ("llamacpp", "llama.cpp")):  # port only to tell two apart
+            group = self.found[kind]
+            for e in group:
+                e.label = f"{name} :{self._port(e)}" if len(group) > 1 else name
+        return self.found
